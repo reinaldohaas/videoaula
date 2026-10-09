@@ -450,6 +450,10 @@ F5_REF_MAX_S = 12         # F5 rende melhor com referência curta (8–12 s)
 
 VOZES_CLONADAS = ("reinaldo_haas", "reinaldo_f5")
 
+# Renderização dos clipes (imagem parada + legendas)
+FPS_CLIPE = 10            # 10 fps: legendas palavra a palavra continuam precisas; 25 só encarece o x264
+FFMPEG_THREADS = 4        # por clipe; com --paralelo N o total é N*4
+
 
 def dividir_em_frases(texto: str) -> list:
     """Quebra o texto em frases; clonagem zero-shot rende melhor em trechos curtos."""
@@ -755,8 +759,11 @@ class MotorVoz:
     # ---------------- interface usada pelo pipeline ----------------
     async def sintetizar_slide(self, texto_fala: str, audio_out_wav: pathlib.Path, work_dir: pathlib.Path):
         if self.nome_voz in VOZES_CLONADAS:
+            t1 = time.time()
             total_dur = self._sintetizar_clonado(texto_fala, audio_out_wav)
+            t2 = time.time()
             words_timing = self._alinhar_palavras(texto_fala, audio_out_wav, total_dur)
+            print(f"  [tempos] síntese {t2-t1:.1f}s | alinhamento {time.time()-t2:.1f}s | áudio {total_dur:.1f}s")
             return total_dur, words_timing
 
         words_timing = await self._sintetizar_edge(texto_fala, audio_out_wav, work_dir)
@@ -948,21 +955,26 @@ async def executar(
         ass_path.write_text(ass_content, encoding="utf-8")
 
         clean_ass = str(ass_path).replace("\\", "/").replace(":", "\\:")
+        # Imagem parada + legendas: 10 fps bastam (destaque de palavras com resolução de 0,1 s) e cortam
+        # o custo do x264 em ~2,5x; preset veryfast + threads limitadas para conviver com trabalhadores paralelos.
         cmd = [
-            "ffmpeg", "-y",
-            "-loop", "1",
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-loop", "1", "-framerate", str(FPS_CLIPE),
             "-i", str(img_path),
             "-i", str(audio_wav),
             "-vf", f"subtitles='{clean_ass}'",
-            "-c:v", "libx264",
+            "-r", str(FPS_CLIPE),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
             "-tune", "stillimage",
-            "-c:a", "aac",
-            "-b:a", "192k",
+            "-threads", str(FFMPEG_THREADS),
+            "-c:a", "aac", "-b:a", "160k",
             "-pix_fmt", "yuv420p",
             "-shortest",
             str(clip_mp4)
         ]
+        t_ff = time.time()
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"  Clipe renderizado em {time.time()-t_ff:.1f}s")
         clipes_gerados.append(clip_mp4)
 
     if not clipes_gerados:
