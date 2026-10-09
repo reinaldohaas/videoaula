@@ -1028,6 +1028,18 @@ def concatenar_clipes(pptx_path, work_dir, clipes_gerados, saida_video, slides_f
 # -------------------------------------------------------------
 # Escolha automática da GPU em nó compartilhado
 # -------------------------------------------------------------
+def quadro_gpus(leituras: int = 2, intervalo: float = 3.0) -> dict:
+    """{indice: (gb_livres_min, util_max)} ao longo de `leituras` consultas ao nvidia-smi."""
+    def ler():
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.free,utilization.gpu",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=20).stdout
+        return {int(i): (float(f) / 1024, int(u)) for i, f, u in (l.split(",") for l in out.strip().splitlines())}
+    lidas = [ler()]
+    for _ in range(leituras - 1):
+        time.sleep(intervalo); lidas.append(ler())
+    return {i: (min(l[i][0] for l in lidas), max(l[i][1] for l in lidas)) for i in lidas[0]}
+
+
 def escolher_gpu(pedido: str = "auto", min_livre_gb: float = 8.0, leituras: int = 2, intervalo: float = 3.0):
     """Define CUDA_VISIBLE_DEVICES antes de qualquer uso de CUDA.
     pedido: 'auto' (placa mais ociosa com memória livre), um índice ('3'), ou 'todas' (não mexe)."""
@@ -1090,15 +1102,50 @@ def executar_paralelo(args, pptx_path: pathlib.Path, slides_filtro: list, n: int
         except Exception:
             pass
 
-    # 0b) Dimensiona N pela VRAM livre (cada trabalhador usa ~6-7 GB com whisperx na GPU)
+    # 0b) Plano de GPUs. Sem o serviço MPS da NVIDIA, vários processos numa MESMA placa se revezam a cada
+    # kernel e um modelo autorregressivo quase não ganha com isso; o ganho real vem de usar VÁRIAS placas.
     VRAM_POR_TRABALHADOR_GB = 7.0
-    if torch.cuda.is_available():
-        livre_gb, total_gb = (x / 1e9 for x in torch.cuda.mem_get_info(0))
-        cabem = max(1, int(livre_gb / VRAM_POR_TRABALHADOR_GB))
-        if n > cabem:
-            print(f"Aviso: {livre_gb:.0f} GB livres na GPU -> reduzindo --paralelo de {n} para {cabem} "
-                  f"(~{VRAM_POR_TRABALHADOR_GB:.0f} GB por trabalhador).")
-            n = cabem
+    MAX_POR_GPU = args.por_gpu
+    slots = []                                        # lista de índices de GPU, um por trabalhador
+    fixo = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if args.gpu not in ("auto", "todas"):
+        fixo = args.gpu
+    try:
+        quadro = quadro_gpus()
+    except Exception:
+        quadro = {}
+    if fixo:
+        idx = [int(x) for x in fixo.split(",") if x.strip().isdigit()]
+        for i in idx:
+            livre = quadro.get(i, (999, 0))[0]
+            slots += [i] * max(1, min(MAX_POR_GPU, int(livre / VRAM_POR_TRABALHADOR_GB)))
+    elif quadro:
+        print("GPUs: " + "  ".join(f"[{i}] {g[0]:.0f}GB livres/{g[1]}%" for i, g in sorted(quadro.items())))
+        ociosas = [(u, -l, i) for i, (l, u) in quadro.items() if u <= args.gpu_util_max and l >= VRAM_POR_TRABALHADOR_GB]
+        for _, _, i in sorted(ociosas):
+            livre = quadro[i][0]
+            slots += [i] * min(MAX_POR_GPU, int(livre / VRAM_POR_TRABALHADOR_GB))
+        if not slots:
+            print("Nenhuma GPU ociosa com memória livre; usando a menos carregada com 1 trabalhador.")
+            i = sorted((u, -l, i) for i, (l, u) in quadro.items())[0][2]
+            slots = [i]
+    if not slots:
+        slots = [None]                                # sem nvidia-smi: deixa o ambiente decidir
+    # Intercala as placas para que os primeiros N slots cubram o máximo de GPUs distintas
+    por_gpu = {}
+    for s in slots:
+        por_gpu.setdefault(s, []).append(s)
+    intercalado = []
+    while any(por_gpu.values()):
+        for g in list(por_gpu):
+            if por_gpu[g]:
+                intercalado.append(por_gpu[g].pop())
+    slots = intercalado
+    if n > len(slots):
+        print(f"Aviso: --paralelo {n} -> {len(slots)} trabalhador(es), limitado por GPUs ociosas/VRAM "
+              f"(máx. {MAX_POR_GPU} por placa; ajuste com --por-gpu).")
+        n = len(slots)
+    slots = slots[:n]
 
     # 1) Roteiro e imagens, uma única vez, no processo pai (evita corrida no LibreOffice/PowerPoint)
     if args.roteiro and pathlib.Path(args.roteiro).exists():
@@ -1144,16 +1191,21 @@ def executar_paralelo(args, pptx_path: pathlib.Path, slides_filtro: list, n: int
 
     logs_dir = work_dir / "logs"; logs_dir.mkdir(exist_ok=True)
     procs = []
-    print(f"\nModo paralelo: {len(fatias)} trabalhadores, {len(roteiro)} slides "
-          f"(GPU: {os.environ.get('CUDA_VISIBLE_DEVICES', 'todas')})")
+    uso = {}
+    for g in slots: uso[g] = uso.get(g, 0) + 1
+    print(f"\nModo paralelo: {len(fatias)} trabalhadores, {len(roteiro)} slides; GPUs: "
+          + ", ".join(f"{g} x{c}" for g, c in sorted(uso.items(), key=lambda x: str(x[0]))))
     t0 = time.time()
     for k, fatia in enumerate(fatias):
         log = logs_dir / f"trabalhador_{k+1:02d}.log"
         cmd = base + ["-s", ",".join(map(str, fatia))]
-        print(f"  [{k+1:02d}] slides {fatia[0]}..{fatia[-1]} ({len(fatia)})  ->  {log.name}")
+        env = os.environ.copy()
+        if slots[k] is not None:
+            env["CUDA_VISIBLE_DEVICES"] = str(slots[k])
+        print(f"  [{k+1:02d}] GPU {slots[k] if slots[k] is not None else '-'}  slides {fatia[0]}..{fatia[-1]} ({len(fatia)})  ->  {log.name}")
         procs.append((k + 1, fatia, subprocess.Popen(cmd, stdout=open(log, "w", encoding="utf-8"),
-                                                     stderr=subprocess.STDOUT, env=os.environ.copy())))
-        time.sleep(3)   # escalona a carga dos modelos na GPU
+                                                     stderr=subprocess.STDOUT, env=env)))
+        time.sleep(3)   # escalona a carga dos modelos
 
     # 4) Acompanha o progresso pelos clipes prontos
     clips_dir = work_dir / "clipes"
@@ -1217,6 +1269,10 @@ def main():
     parser.add_argument("--gpu", default="auto", metavar="N|auto|todas",
                         help="Qual GPU usar num nó com várias: 'auto' escolhe a mais ociosa com memória livre (padrão); "
                              "um índice fixa; 'todas' não altera CUDA_VISIBLE_DEVICES.")
+    parser.add_argument("--por-gpu", type=int, default=2, metavar="K",
+                        help="No modo paralelo, máximo de trabalhadores por placa (padrão 2; sem MPS, mais que isso rende pouco)")
+    parser.add_argument("--gpu-util-max", type=int, default=15, metavar="PCT",
+                        help="No modo paralelo, só usa placas com utilização <= PCT%% (padrão 15)")
     parser.add_argument("--paralelo", "-p", type=int, default=1, metavar="N",
                         help="Sintetiza com N processos em paralelo na mesma GPU (~3,5 GB de VRAM cada). "
                              "Em GPU grande (>= 24 GB) use 4-8; speedup quase linear.")
@@ -1246,7 +1302,7 @@ def main():
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-    if not args.so_clipes:            # trabalhadores herdam a escolha do pai
+    if not args.so_clipes and args.paralelo <= 1:     # no modo paralelo o pai planeja as GPUs por trabalhador
         escolher_gpu(args.gpu)
 
     pptx_path = None
