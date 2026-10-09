@@ -450,6 +450,20 @@ F5_REF_MAX_S = 12         # F5 rende melhor com referência curta (8–12 s)
 
 VOZES_CLONADAS = ("reinaldo_haas", "reinaldo_f5")
 
+def _ambiente_ffmpeg() -> dict:
+    """Garante um cache de fontconfig persistente e gravável (sem isso, o filtro de legendas pode
+    reconstruir o cache de fontes a cada chamada do ffmpeg — dezenas de segundos por clipe)."""
+    env = os.environ.copy()
+    if sys.platform != "win32":
+        cache = pathlib.Path(env.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache")) / "fontconfig"
+        try:
+            cache.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        env.setdefault("FONTCONFIG_CACHE", str(cache))
+    return env
+
+
 # Renderização dos clipes (imagem parada + legendas)
 FPS_CLIPE = 10            # 10 fps: legendas palavra a palavra continuam precisas; 25 só encarece o x264
 FFMPEG_THREADS = 4        # por clipe; com --paralelo N o total é N*4
@@ -513,7 +527,7 @@ def _preencher_tempos_faltantes(palavras: list, total_dur: float) -> list:
 class MotorVoz:
     def __init__(self, nome_voz: str = "reinaldo_haas", amostra_ref: pathlib.Path = None,
                  cfg_weight: float = CB_CFG_WEIGHT, exaggeration: float = CB_EXAGGERATION,
-                 permitir_cpu: bool = False, usar_fp16: bool = False):
+                 permitir_cpu: bool = False, usar_fp16: bool = False, alinhar_cpu: bool = False):
         self.nome_voz = nome_voz
         self.cfg_weight = cfg_weight
         self.exaggeration = exaggeration
@@ -557,7 +571,7 @@ class MotorVoz:
             # Alinhamento roda na CPU de propósito: é barato e libera ~1,2 GB de VRAM para o Chatterbox.
             # GPUs com pouca memória (<= 6 GB) caem em "memória compartilhada" do Windows e ficam 10x mais lentas.
             vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if self.device == "cuda" else 0
-            self.align_device = "cuda" if vram_gb >= 12 else "cpu"
+            self.align_device = "cuda" if (vram_gb >= 12 and not alinhar_cpu) else "cpu"
             print(f"Carregando modelo de alinhamento whisperx (pt) na {self.align_device.upper()}...")
             import whisperx
             self.align_model, self.align_meta = whisperx.load_align_model(
@@ -814,6 +828,7 @@ async def executar(
     exaggeration: float = CB_EXAGGERATION,
     permitir_cpu: bool = False,
     usar_fp16: bool = False,
+    alinhar_cpu: bool = False,
     offset_sincronia: float = -0.12,
     forcar: bool = False,
     so_clipes: bool = False,          # trabalhador paralelo: gera clipes e não concatena
@@ -866,7 +881,8 @@ async def executar(
           f"voz '{nome_voz}', dispositivo: {'GPU ' + torch.cuda.get_device_name(0) if gpu else 'CPU'})...")
     try:
         motor = MotorVoz(nome_voz, amostra_ref=amostra_ref, cfg_weight=cfg_weight,
-                         exaggeration=exaggeration, permitir_cpu=permitir_cpu, usar_fp16=usar_fp16)
+                         exaggeration=exaggeration, permitir_cpu=permitir_cpu, usar_fp16=usar_fp16,
+                         alinhar_cpu=alinhar_cpu)
     except RuntimeError as e:
         if "GPU nao detectada" in str(e):
             print(f"\nERRO: {e}")
@@ -973,7 +989,11 @@ async def executar(
             str(clip_mp4)
         ]
         t_ff = time.time()
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        import tempfile, shutil as _sh
+        tmp_mp4 = pathlib.Path(tempfile.gettempdir()) / f"{pptx_path.stem}_clip_{s_num:03d}_{os.getpid()}.mp4"
+        cmd[-1] = str(tmp_mp4)
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_ambiente_ffmpeg())
+        _sh.move(str(tmp_mp4), str(clip_mp4))
         print(f"  Clipe renderizado em {time.time()-t_ff:.1f}s")
         clipes_gerados.append(clip_mp4)
 
@@ -1104,7 +1124,7 @@ def executar_paralelo(args, pptx_path: pathlib.Path, slides_filtro: list, n: int
 
     # 0b) Plano de GPUs. Sem o serviço MPS da NVIDIA, vários processos numa MESMA placa se revezam a cada
     # kernel e um modelo autorregressivo quase não ganha com isso; o ganho real vem de usar VÁRIAS placas.
-    VRAM_POR_TRABALHADOR_GB = 7.0
+    VRAM_POR_TRABALHADOR_GB = 6.0          # Chatterbox + whisperx (GPU) + buffers
     MAX_POR_GPU = args.por_gpu
     slots = []                                        # lista de índices de GPU, um por trabalhador
     fixo = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -1269,6 +1289,8 @@ def main():
     parser.add_argument("--gpu", default="auto", metavar="N|auto|todas",
                         help="Qual GPU usar num nó com várias: 'auto' escolhe a mais ociosa com memória livre (padrão); "
                              "um índice fixa; 'todas' não altera CUDA_VISIBLE_DEVICES.")
+    parser.add_argument("--alinhar-cpu", action="store_true",
+                        help="Roda o alinhamento whisperx na CPU (menos VRAM por processo; automático no modo paralelo)")
     parser.add_argument("--por-gpu", type=int, default=2, metavar="K",
                         help="No modo paralelo, máximo de trabalhadores por placa (padrão 2; sem MPS, mais que isso rende pouco)")
     parser.add_argument("--gpu-util-max", type=int, default=15, metavar="PCT",
@@ -1364,6 +1386,7 @@ def main():
         exaggeration=args.exag,
         permitir_cpu=args.permitir_cpu,
         usar_fp16=args.fp16,
+        alinhar_cpu=args.alinhar_cpu,
         offset_sincronia=args.offset,
         forcar=args.forcar,
         so_clipes=args.so_clipes,
