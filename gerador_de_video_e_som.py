@@ -551,6 +551,10 @@ class MotorVoz:
             if not amostra.exists():
                 raise FileNotFoundError(f"Amostra de referência não encontrada: {amostra}")
             self.ref_wav = self._preparar_referencia(amostra)
+            if sys.platform != "win32":
+                import tempfile, shutil as _sh
+                ref_loc = pathlib.Path(tempfile.gettempdir()) / f"videoaula_ref_{os.getpid()}.wav"
+                _sh.copyfile(self.ref_wav, ref_loc); self.ref_wav_origem = self.ref_wav; self.ref_wav = ref_loc
 
             if nome_voz == "reinaldo_haas":
                 print(f"Carregando Chatterbox Multilingual ({self.device})...")
@@ -586,7 +590,7 @@ class MotorVoz:
     def assinatura(self) -> dict:
         """Identifica o que gerou um áudio; se mudar (motor, amostra, parâmetros), o cache é invalidado."""
         if self.nome_voz == "reinaldo_haas":
-            ref = pathlib.Path(self.ref_wav)
+            ref = pathlib.Path(getattr(self, "ref_wav_origem", self.ref_wav))
             return {
                 "motor": "chatterbox-multilingual",
                 "amostra": ref.name,
@@ -597,7 +601,7 @@ class MotorVoz:
                 "fp16": bool(self.usar_fp16),
             }
         if self.nome_voz == "reinaldo_f5":
-            ref = pathlib.Path(self.ref_wav)
+            ref = pathlib.Path(getattr(self, "ref_wav_origem", self.ref_wav))
             return {
                 "motor": "f5-tts-ptbr",
                 "repo": F5_REPO,
@@ -773,11 +777,17 @@ class MotorVoz:
     # ---------------- interface usada pelo pipeline ----------------
     async def sintetizar_slide(self, texto_fala: str, audio_out_wav: pathlib.Path, work_dir: pathlib.Path):
         if self.nome_voz in VOZES_CLONADAS:
+            import tempfile, shutil as _sh
+            tmp_wav = pathlib.Path(tempfile.gettempdir()) / f"videoaula_{os.getpid()}_{audio_out_wav.name}"
             t1 = time.time()
-            total_dur = self._sintetizar_clonado(texto_fala, audio_out_wav)
+            total_dur = self._sintetizar_clonado(texto_fala, tmp_wav)
             t2 = time.time()
-            words_timing = self._alinhar_palavras(texto_fala, audio_out_wav, total_dur)
-            print(f"  [tempos] síntese {t2-t1:.1f}s | alinhamento {time.time()-t2:.1f}s | áudio {total_dur:.1f}s")
+            words_timing = self._alinhar_palavras(texto_fala, tmp_wav, total_dur)
+            t3 = time.time()
+            _sh.copyfile(tmp_wav, audio_out_wav)
+            try: tmp_wav.unlink()
+            except Exception: pass
+            print(f"  [tempos] síntese {t2-t1:.1f}s | alinhamento {t3-t2:.1f}s | áudio {total_dur:.1f}s")
             return total_dur, words_timing
 
         words_timing = await self._sintetizar_edge(texto_fala, audio_out_wav, work_dir)
@@ -798,7 +808,14 @@ class MotorVoz:
         )
         total_dur = float(res.stdout.strip())
         if self.nome_voz in VOZES_CLONADAS:
-            return total_dur, self._alinhar_palavras(texto_fala, audio_out_wav, total_dur)
+            import tempfile, shutil as _sh
+            tmp_wav = pathlib.Path(tempfile.gettempdir()) / f"videoaula_{os.getpid()}_{audio_out_wav.name}"
+            _sh.copyfile(audio_out_wav, tmp_wav)
+            try:
+                return total_dur, self._alinhar_palavras(texto_fala, tmp_wav, total_dur)
+            finally:
+                try: tmp_wav.unlink()
+                except Exception: pass
         # edge-tts: reconsulta apenas os WordBoundary (rápido, sem baixar áudio novo)
         import edge_tts
         voice_base = "pt-BR-FranciscaNeural" if self.nome_voz == "francisca" else "pt-BR-AntonioNeural"
@@ -990,10 +1007,22 @@ async def executar(
         ]
         t_ff = time.time()
         import tempfile, shutil as _sh
-        tmp_mp4 = pathlib.Path(tempfile.gettempdir()) / f"{pptx_path.stem}_clip_{s_num:03d}_{os.getpid()}.mp4"
+        # Entradas e saída em disco LOCAL: o "-loop 1" relê o PNG a cada quadro e o /home de um cluster
+        # (NFS/FUSE) pode levar minutos nisso; copiar uma vez para /tmp resolve.
+        tmpd = pathlib.Path(tempfile.gettempdir()) / f"videoaula_{os.getpid()}"
+        tmpd.mkdir(exist_ok=True)
+        img_loc = tmpd / img_path.name; wav_loc = tmpd / audio_wav.name; ass_loc = tmpd / ass_path.name
+        _sh.copyfile(img_path, img_loc); _sh.copyfile(audio_wav, wav_loc); _sh.copyfile(ass_path, ass_loc)
+        tmp_mp4 = tmpd / clip_mp4.name
+        cmd[cmd.index(str(img_path))] = str(img_loc)
+        cmd[cmd.index(str(audio_wav))] = str(wav_loc)
+        cmd[cmd.index("-vf") + 1] = f"subtitles='{str(ass_loc).replace(chr(92), '/').replace(':', chr(92) + ':')}'"
         cmd[-1] = str(tmp_mp4)
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_ambiente_ffmpeg())
         _sh.move(str(tmp_mp4), str(clip_mp4))
+        for f in (img_loc, wav_loc, ass_loc):
+            try: f.unlink()
+            except Exception: pass
         print(f"  Clipe renderizado em {time.time()-t_ff:.1f}s")
         clipes_gerados.append(clip_mp4)
 
