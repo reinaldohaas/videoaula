@@ -9,20 +9,21 @@ Desenvolvido para a disciplina FSC7116 – Mesoescala (UFSC), mas serve para qua
 
 ## Como funciona
 
+Quatro estágios, cada um uma função sobre arquivos em `video_work/<aula>/`:
+
 ```
-.pptx ──► slides PNG + texto das anotações
-              │
-              ├─► motor de voz (frase a frase, com a amostra de referência)
-              │        reinaldo_haas : Chatterbox Multilingual (zero-shot)
-              │        reinaldo_f5   : F5-TTS pt-BR (mais leve, ajustado em português)
-              │        antonio/francisca : edge-tts (nuvem, fallback)
-              ├─► whisperx: alinhamento forçado → tempo de cada palavra
-              ├─► legendas .ass (palavra atual em destaque)
-              └─► ffmpeg: clipe por slide → concatenação → video/<aula>_AULA_COMPLETA.mp4
+1. extrair      .pptx -> slides_img/*.png  +  roteiro (anotações do orador)
+2. sintetizar   texto -> audio/*.wav  (voz clonada, frase a frase)  +  tempo de cada palavra (whisperx)
+3. legendar     tempos -> legendas/*.ass  (palavra atual em destaque, pontuação original)
+4. renderizar   png + wav + ass -> clipes/*.mp4  ->  video/<aula>.mp4
 ```
 
-Cache inteligente: cada áudio guarda uma assinatura (texto, motor, amostra, parâmetros).
-Só regenera o que mudou — editar a anotação de um slide refaz só aquele slide.
+Motores de voz (`--voz`): `reinaldo_haas` Chatterbox Multilingual (zero-shot, padrão);
+`reinaldo_f5` F5-TTS ajustado em pt-BR (mais leve); `antonio`/`francisca` edge-tts (nuvem, sem clonagem).
+
+Cache: cada áudio guarda uma assinatura (texto, motor, amostra, parâmetros) e só é refeito se algo mudou —
+editar a anotação de um slide regenera só aquele slide. Em nó com várias GPUs, `--paralelo N` espalha
+trabalhadores pelas placas ociosas; o ffmpeg roda em segundo plano enquanto a GPU sintetiza o próximo slide.
 
 ## Requisitos
 

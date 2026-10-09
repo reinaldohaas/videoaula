@@ -1,71 +1,82 @@
 """
-Gerador de Vídeo e Som para Aulas e Apresentações
-Converte apresentações PowerPoint (.pptx) diretamente em vídeo-aulas Full HD,
-com narração pela voz clonada LOCALMENTE do Prof. Reinaldo Haas
-(Chatterbox Multilingual + alinhamento whisperx) ou vozes edge-tts como fallback,
-legendas sincronizadas palavra por palavra em tempo real (WordBoundary),
-avisos visuais no topo de até 5s, legendas 30% maiores,
-áudio e legendas baseados EXCLUSIVAMENTE nas anotações do PPT,
-e salvamento automático na pasta 'video'.
+gerador_de_video_e_som.py — vídeo-aula a partir de um .pptx com a voz clonada do professor.
+
+Pipeline em quatro estágios, cada um uma função pura sobre arquivos:
+
+  1. extrair      .pptx  ->  slides PNG + roteiro (texto das anotações do orador)
+  2. sintetizar   texto  ->  .wav com a voz clonada  +  tempo de cada palavra
+  3. legendar     tempos ->  .ass (palavra atual em destaque, pontuação original)
+  4. renderizar   PNG + wav + ass  ->  clipe .mp4 por slide  ->  concatenação
+
+Motores de voz (--voz):
+  reinaldo_haas  Chatterbox Multilingual, clonagem zero-shot (padrão)
+  reinaldo_f5    F5-TTS ajustado em pt-BR (mais leve e rápido)
+  antonio / francisca   edge-tts (nuvem Microsoft), sem clonagem
+
+Cache: cada áudio guarda uma assinatura (texto, motor, amostra, parâmetros). Só regenera o que mudou.
+Tudo roda localmente; o Hugging Face só é consultado com --online.
+
+Uso:
+  python gerador_de_video_e_som.py aula.pptx                 # aula inteira
+  python gerador_de_video_e_som.py aula.pptx -s 3-5          # alguns slides
+  python gerador_de_video_e_som.py aula.pptx --paralelo 6    # várias GPUs
+  python gerador_de_video_e_som.py -h
 """
+import argparse, asyncio, json, os, pathlib, re, shutil, subprocess, sys, tempfile, time
 
-import argparse
-import asyncio
-import json
-import os
-import pathlib
-import re
-import subprocess
-import sys
-import time
-
-
-def _cpus_disponiveis() -> int:
-    """Núcleos realmente utilizáveis: cota do cgroup (contêiner/cluster) ou affinity, não o total do nó."""
+# ------------------------------------------------------------------ CPU threads (antes do torch)
+def _cpus() -> int:
     n = os.cpu_count() or 1
+    try: n = min(n, len(os.sched_getaffinity(0)))
+    except Exception: pass
     try:
-        n = min(n, len(os.sched_getaffinity(0)))
-    except Exception:
-        pass
-    for caminho in ("/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"):
-        try:
-            partes = open(caminho).read().split()
-            if partes[0] != "max" and int(partes[0]) > 0:
-                periodo = int(partes[1]) if len(partes) > 1 else int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read())
-                n = min(n, max(1, int(int(partes[0]) / periodo)))
-                break
-        except Exception:
-            continue
-    return max(1, n)
-
-
-_N_CPU = _cpus_disponiveis()
-for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-    os.environ.setdefault(_v, str(min(_N_CPU, 16)))
-
+        q = open("/sys/fs/cgroup/cpu.max").read().split()
+        if q[0] != "max": n = min(n, max(1, int(q[0]) // int(q[1])))
+    except Exception: pass
+    return n
+N_CPU = _cpus()
+for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_v, str(min(N_CPU, 16)))
 import torch
-torch.set_num_threads(min(_N_CPU, 16))
+torch.set_num_threads(min(N_CPU, 16))
 
-TOOL_DIR = pathlib.Path(__file__).resolve().parent
-VOZES_DIR = TOOL_DIR / "vozes"
+# ------------------------------------------------------------------ configuração
+AQUI = pathlib.Path(__file__).resolve().parent
+AMOSTRA_PADRAO = AQUI / "voz_referencia" / "amostra_nova.mp3"
+WINDOWS = sys.platform == "win32"
+FONTE_LEGENDA = "Segoe UI" if WINDOWS else "DejaVu Sans"
+VOZES_CLONADAS = ("reinaldo_haas", "reinaldo_f5")
 
-# Textos padrão dos avisos no topo da tela (exibidos por até 5 segundos)
-DEFAULT_AVISO_INICIO = (
-    r"{\c&H00D7FF&\b1}UFSC · PROF. REINALDO HAAS\N"
-    r"{\c&HFFFFFF&\b1}VOZ CLONADA LOCALMENTE POR PROGRAMA DE COMPUTADOR"
-)
+CB_CFG, CB_EXAG, CB_TEMP = 0.4, 0.45, 0.7       # Chatterbox: cfg menor = mais fiel ao timbre
+F5_REPO = "traderpedroso/F5-TTS-BRAZILIAN-PORTUGUESE"
+F5_NFE, F5_CFG, F5_SPEED, F5_REF_S = 32, 2.0, 0.95, 12
+PAUSA_FRASES = 0.35                              # s de silêncio entre frases
+FPS_CLIPE, FFMPEG_THREADS = 10, 4                # imagem parada: 10 fps bastam para as legendas
 
-DEFAULT_AVISO_FIM = (
-    r"{\c&H00D7FF&\b1}UFSC · PROF. REINALDO HAAS\N"
-    r"{\c&HFFFFFF&\b1}FIM DA AULA · BONS ESTUDOS COM OS EXERCÍCIOS!"
-)
+DEFAULT_AVISO_INICIO = (r"{\c&H00D7FF&\b1}UFSC · PROF. REINALDO HAAS\N"
+                        r"{\c&HFFFFFF&\b1}VOZ CLONADA LOCALMENTE POR PROGRAMA DE COMPUTADOR")
+DEFAULT_AVISO_FIM = (r"{\c&H00D7FF&\b1}UFSC · PROF. REINALDO HAAS\N"
+                     r"{\c&HFFFFFF&\b1}FIM DA AULA · BONS ESTUDOS COM OS EXERCÍCIOS!")
 
-# -------------------------------------------------------------
-# Normalização Fonética de Texto para Fala
-# -------------------------------------------------------------
+
+def tmp_local(nome: str) -> pathlib.Path:
+    """Arquivo em disco local: o /home de um cluster (NFS/FUSE) é lento para leituras repetidas."""
+    d = pathlib.Path(tempfile.gettempdir()) / f"videoaula_{os.getpid()}"
+    d.mkdir(exist_ok=True)
+    return d / nome
+
+
+def duracao(wav: pathlib.Path) -> float:
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "default=nw=1:nk=1", str(wav)], capture_output=True, text=True, check=True)
+    return float(r.stdout.strip())
+
+
+# ================================================================== 1. EXTRAIR
 def normalizar_para_fala(texto: str) -> str:
     t = texto
-    # Remove número isolado de página no final de notas
+    # Número de página solto no fim das anotações (mas não "Capítulo 3", tratado antes)
+    t = re.sub(r'\b(Cap[ií]tulo)\s+(\d+)\s*$', lambda m: f"{m.group(1)} {m.group(2)}.", t, flags=re.IGNORECASE)
     t = re.sub(r'\s+\d+\s*$', '', t)
     t = re.sub(r'\bUFSC\b', 'U F S C', t)
     t = re.sub(r'\bSALLJ\b', 'S A L L Jota', t)
@@ -105,17 +116,285 @@ def normalizar_para_fala(texto: str) -> str:
     t = re.sub(r'\s+', ' ', t).strip()
     return t
 
-# -------------------------------------------------------------
-# Utilitários de Legendas ASS Full HD (com Top Banner e Fonte +30%)
-# -------------------------------------------------------------
+
+
+def _item(i, img, notas, textos_slide):
+    base = notas.strip() or " ".join(textos_slide)
+    fala = normalizar_para_fala(base)
+    return {"slide": i, "imagem": img.name, "texto_fala": fala, "texto_original": base}
+
+
+def extrair(pptx: pathlib.Path, img_dir: pathlib.Path, slides: list = None) -> list:
+    """Exporta os slides pedidos para PNG 1920x1080 (com cache) e lê as anotações do orador."""
+    img_dir.mkdir(parents=True, exist_ok=True)
+    return (_extrair_windows if WINDOWS else _extrair_linux)(pptx, img_dir, slides)
+
+
+def _precisa_png(img: pathlib.Path, pptx: pathlib.Path) -> bool:
+    return not img.exists() or img.stat().st_size == 0 or img.stat().st_mtime < pptx.stat().st_mtime
+
+
+def _extrair_windows(pptx, img_dir, slides):
+    import win32com.client
+    app = win32com.client.Dispatch("PowerPoint.Application")
+    roteiro = []
+    try:
+        pres = app.Presentations.Open(str(pptx.resolve()), ReadOnly=True, Untitled=False, WithWindow=False)
+        alvos = [s for s in range(1, pres.Slides.Count + 1) if not slides or s in slides]
+        print(f"{pptx.name}: {pres.Slides.Count} slides, preparando {len(alvos)} [PowerPoint]")
+        for i in alvos:
+            sl = pres.Slides(i); img = img_dir / f"slide_{i:03d}.png"
+            if _precisa_png(img, pptx):
+                sl.Export(str(img), "PNG", 1920, 1080)
+            notas = ""
+            if sl.HasNotesPage:
+                for sh in sl.NotesPage.Shapes:
+                    if sh.HasTextFrame and sh.TextFrame.HasText:
+                        t = sh.TextFrame.TextRange.Text.strip()
+                        if t and not t.isdigit(): notas += " " + t
+            textos = [sh.TextFrame.TextRange.Text.strip() for sh in sl.Shapes
+                      if sh.HasTextFrame and sh.TextFrame.HasText and sh.TextFrame.TextRange.Text.strip()]
+            roteiro.append(_item(i, img, notas, textos))
+        pres.Close()
+    finally:
+        try: app.Quit()
+        except Exception: pass
+    return roteiro
+
+
+def _extrair_linux(pptx, img_dir, slides):
+    """LibreOffice headless -> PDF -> pdftoppm; anotações via python-pptx."""
+    from pptx import Presentation
+    pres = Presentation(str(pptx))
+    total = len(pres.slides)
+    alvos = [s for s in range(1, total + 1) if not slides or s in slides]
+    print(f"{pptx.name}: {total} slides, preparando {len(alvos)} [LibreOffice]")
+    faltam = [i for i in alvos if _precisa_png(img_dir / f"slide_{i:03d}.png", pptx)]
+    if faltam:
+        soffice = shutil.which("soffice") or shutil.which("libreoffice")
+        if not soffice or not shutil.which("pdftoppm"):
+            raise RuntimeError("Preciso de LibreOffice (soffice) e poppler (pdftoppm): "
+                               "mamba install -c conda-forge libreoffice poppler")
+        pdf = img_dir / (pptx.stem + ".pdf")
+        if not pdf.exists() or pdf.stat().st_mtime < pptx.stat().st_mtime:
+            subprocess.run([soffice, "--headless", "--convert-to", "pdf", "--outdir", str(img_dir), str(pptx)],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+        for i in faltam:
+            pref = img_dir / f"_p{i:03d}"
+            subprocess.run(["pdftoppm", "-png", "-f", str(i), "-l", str(i), "-scale-to-x", "1920",
+                            "-scale-to-y", "1080", str(pdf), str(pref)], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            gerados = sorted(img_dir.glob(f"_p{i:03d}*.png"))
+            gerados[0].replace(img_dir / f"slide_{i:03d}.png")
+            for g in gerados[1:]: g.unlink()
+    roteiro = []
+    for i in alvos:
+        sl = pres.slides[i - 1]
+        notas = sl.notes_slide.notes_text_frame.text if sl.has_notes_slide and sl.notes_slide.notes_text_frame else ""
+        textos = [sh.text_frame.text.strip() for sh in sl.shapes if sh.has_text_frame and sh.text_frame.text.strip()]
+        roteiro.append(_item(i, img_dir / f"slide_{i:03d}.png", notas, textos))
+    return roteiro
+
+
+# ================================================================== 2. SINTETIZAR
+def dividir_em_frases(texto: str, max_chars: int = 220) -> list:
+    """Clonagem zero-shot rende melhor em trechos curtos."""
+    frases = []
+    for p in re.split(r"(?<=[.!?;:])\s+", texto.strip()):
+        p = p.strip()
+        if not p: continue
+        if len(p) <= max_chars:
+            frases.append(p); continue
+        buf = ""
+        for s in re.split(r"(?<=,)\s+", p):
+            if buf and len(buf) + len(s) > max_chars:
+                frases.append(buf.strip()); buf = s
+            else:
+                buf = (buf + " " + s).strip()
+        if buf: frases.append(buf.strip())
+    return frases
+
+
+def _interpolar_tempos(palavras: list, total: float) -> list:
+    """whisperx não marca tempo em alguns tokens (números, siglas): interpola entre vizinhos."""
+    out = [[w, s, e] for w, s, e in palavras]; n = len(out)
+    for i in range(n):
+        if out[i][1] is not None: continue
+        j0 = i
+        while j0 > 0 and out[j0 - 1][1] is None: j0 -= 1
+        prev_e = out[j0 - 1][2] if j0 > 0 else 0.0
+        k = i
+        while k < n and out[k][1] is None: k += 1
+        next_s = out[k][1] if k < n else total
+        passo = (next_s - prev_e) / max(k - j0, 1)
+        for m in range(j0, k):
+            out[m][1] = prev_e + passo * (m - j0); out[m][2] = prev_e + passo * (m - j0 + 1)
+    return [(w, float(s), float(e)) for w, s, e in out]
+
+
+class Sintetizador:
+    """Interface única: sintetizar(texto, wav_destino) -> (duracao_s, [(palavra, inicio, fim), ...])."""
+
+    def __init__(self, voz: str, amostra: pathlib.Path = None, cfg=CB_CFG, exag=CB_EXAG, permitir_cpu=False):
+        self.voz, self.cfg, self.exag = voz, cfg, exag
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        if voz not in VOZES_CLONADAS:
+            return
+        if self.device == "cpu" and not permitir_cpu:
+            raise RuntimeError("GPU não detectada (torch.cuda.is_available() == False); na CPU cada slide leva ~10 min. "
+                               "Reinstale o torch com CUDA ou use --permitir-cpu.")
+        self.amostra = pathlib.Path(amostra or AMOSTRA_PADRAO)
+        if not self.amostra.exists():
+            raise FileNotFoundError(f"Amostra de voz não encontrada: {self.amostra}")
+        self.ref = self._referencia_24k(self.amostra)
+        if voz == "reinaldo_haas":
+            from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+            print(f"Carregando Chatterbox Multilingual ({self.device})...")
+            self.tts = ChatterboxMultilingualTTS.from_pretrained(device=self.device)
+            self.sr = self.tts.sr
+            self.tts.prepare_conditionals(str(self.ref), exaggeration=exag)   # codifica a amostra uma vez
+        else:
+            self.ref, self.ref_text = self._referencia_f5(self.ref)
+            self._carregar_f5()
+        import whisperx
+        self.align_dev = "cuda" if (self.device == "cuda" and
+                                    torch.cuda.get_device_properties(0).total_memory > 12e9) else "cpu"
+        print(f"Carregando alinhador whisperx (pt) na {self.align_dev.upper()}...")
+        self.align_model, self.align_meta = whisperx.load_align_model(language_code="pt", device=self.align_dev)
+        print(f"Voz clonada ativa ({voz}) a partir de {self.amostra.name}")
+
+    # ---- referência ----
+    @staticmethod
+    def _referencia_24k(amostra: pathlib.Path) -> pathlib.Path:
+        wav = amostra.with_name(amostra.stem + "_ref24k.wav")
+        if not wav.exists() or wav.stat().st_mtime < amostra.stat().st_mtime:
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(amostra), "-ar", "24000", "-ac", "1",
+                            "-af", "loudnorm=I=-20:TP=-2", str(wav)], check=True)
+        loc = tmp_local(wav.name); shutil.copyfile(wav, loc)
+        return loc
+
+    @staticmethod
+    def _referencia_f5(ref: pathlib.Path):
+        """Trecho curto (<= F5_REF_S s, sem silêncio inicial) + transcrição em .txt ao lado da amostra.
+        EDITE o .txt se o Whisper errar: o F5 depende dele."""
+        clip = AMOSTRA_PADRAO.parent / f"f5_ref{F5_REF_S}s.wav"
+        txt = clip.with_suffix(".txt")
+        if not clip.exists() or clip.stat().st_mtime < ref.stat().st_mtime:
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(ref), "-af",
+                            "silenceremove=start_periods=1:start_threshold=-40dB:start_silence=0.2",
+                            "-t", str(F5_REF_S), "-ar", "24000", "-ac", "1", str(clip)], check=True)
+            if txt.exists(): txt.unlink()
+        if not (txt.exists() and txt.read_text(encoding="utf-8").strip()):
+            print("Transcrevendo a referência uma vez (faster-whisper)...")
+            from faster_whisper import WhisperModel
+            segs, _ = WhisperModel("small", device="cpu", compute_type="int8").transcribe(str(clip), language="pt")
+            txt.write_text(" ".join(s.text.strip() for s in segs), encoding="utf-8")
+            print(f"  salvo em {txt} — confira o texto.")
+        loc = tmp_local(clip.name); shutil.copyfile(clip, loc)
+        return loc, txt.read_text(encoding="utf-8").strip()
+
+    def _carregar_f5(self):
+        from huggingface_hub import snapshot_download
+        from f5_tts.api import F5TTS
+        pasta = pathlib.Path(snapshot_download(F5_REPO, local_files_only=os.environ.get("HF_HUB_OFFLINE") == "1"))
+        ckpt = max(list(pasta.rglob("*.safetensors")) + list(pasta.rglob("*.pt")), key=lambda f: f.stat().st_size)
+        vocab = next(iter(pasta.rglob("vocab.txt")), None)
+        print(f"Carregando F5-TTS pt-BR ({self.device}): {ckpt.name}")
+        erro = None
+        for arq in ("F5TTS_Base", "F5TTS_v1_Base"):
+            try:
+                self.tts = F5TTS(model=arq, ckpt_file=str(ckpt), vocab_file=str(vocab or ""), device=self.device)
+                return
+            except Exception as e:
+                erro = e
+        raise RuntimeError(f"F5-TTS não carregou com nenhuma arquitetura conhecida: {erro}")
+
+    # ---- geração ----
+    def _frase(self, frase: str) -> torch.Tensor:
+        with torch.inference_mode():
+            if self.voz == "reinaldo_haas":
+                return self.tts.generate(frase, language_id="pt", exaggeration=self.exag,
+                                         cfg_weight=self.cfg, temperature=CB_TEMP).cpu()
+            import numpy as np
+            wav, sr, _ = self.tts.infer(ref_file=str(self.ref), ref_text=self.ref_text, gen_text=frase,
+                                        nfe_step=F5_NFE, cfg_strength=F5_CFG, speed=F5_SPEED,
+                                        remove_silence=False, show_info=lambda *a, **k: None, progress=None)
+            self.sr = sr
+            t = torch.from_numpy(np.asarray(wav, dtype=np.float32))
+            return t.unsqueeze(0) if t.dim() == 1 else t
+
+    def _clonado(self, texto: str, wav_out: pathlib.Path):
+        import torchaudio
+        pedacos = []
+        for f in dividir_em_frases(texto):
+            pedacos += [self._frase(f), torch.zeros(1, int(PAUSA_FRASES * self.sr))]
+        audio = torch.cat(pedacos[:-1], dim=1)
+        audio = audio / audio.abs().max().clamp(min=1e-6) * 0.9
+        torchaudio.save(str(wav_out), audio, self.sr)
+        if self.device == "cuda": torch.cuda.empty_cache()
+        return audio.shape[1] / self.sr
+
+    def alinhar(self, texto: str, wav: pathlib.Path, total: float) -> list:
+        """Alinhamento forçado: o texto é conhecido, só recuperamos os tempos das palavras."""
+        import whisperx
+        audio = whisperx.load_audio(str(wav))
+        res = whisperx.align([{"text": texto, "start": 0.0, "end": total}], self.align_model, self.align_meta,
+                             audio, self.align_dev, return_char_alignments=False)
+        pal = [(w.get("word", "").strip(), w.get("start"), w.get("end")) for w in res.get("word_segments", [])]
+        pal = [p for p in pal if p[0]]
+        if not pal:
+            toks = texto.split(); passo = total / max(len(toks), 1)
+            return [(t, i * passo, (i + 1) * passo) for i, t in enumerate(toks)]
+        return _interpolar_tempos(pal, total)
+
+    async def _edge(self, texto: str, wav_out: pathlib.Path):
+        import edge_tts
+        voz = "pt-BR-FranciscaNeural" if self.voz == "francisca" else "pt-BR-AntonioNeural"
+        c = edge_tts.Communicate(texto, voz, boundary="WordBoundary")
+        mp3 = tmp_local("edge.mp3"); dados = bytearray(); palavras = []
+        async for ch in c.stream():
+            if ch["type"] == "audio": dados.extend(ch["data"])
+            elif ch["type"] == "WordBoundary":
+                s = ch["offset"] / 1e7; palavras.append((ch["text"], s, s + ch["duration"] / 1e7))
+        mp3.write_bytes(dados)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3), "-ar", "24000", "-ac", "1", str(wav_out)], check=True)
+        return palavras
+
+    async def sintetizar(self, texto: str, wav_out: pathlib.Path):
+        loc = tmp_local(wav_out.name)
+        if self.voz in VOZES_CLONADAS:
+            t0 = time.time(); dur = self._clonado(texto, loc); t1 = time.time()
+            palavras = self.alinhar(texto, loc, dur)
+            print(f"  [tempos] síntese {t1-t0:.1f}s | alinhamento {time.time()-t1:.1f}s | áudio {dur:.1f}s")
+        else:
+            palavras = await self._edge(texto, loc); dur = duracao(loc)
+        shutil.copyfile(loc, wav_out); loc.unlink(missing_ok=True)
+        return dur, palavras
+
+    def realinhar(self, texto: str, wav: pathlib.Path):
+        """Áudio em cache sem tempos: recupera só o alinhamento."""
+        loc = tmp_local(wav.name); shutil.copyfile(wav, loc)
+        dur = duracao(loc)
+        pal = self.alinhar(texto, loc, dur) if self.voz in VOZES_CLONADAS else asyncio.run(self._edge(texto, loc))
+        loc.unlink(missing_ok=True)
+        return dur, pal
+
+    def assinatura(self) -> dict:
+        if self.voz == "reinaldo_haas":
+            return {"motor": "chatterbox", "amostra": self.amostra.name, "mtime": int(self.amostra.stat().st_mtime),
+                    "cfg": self.cfg, "exag": self.exag, "temp": CB_TEMP}
+        if self.voz == "reinaldo_f5":
+            return {"motor": "f5-ptbr", "amostra": self.amostra.name, "mtime": int(self.amostra.stat().st_mtime),
+                    "ref_text": self.ref_text, "nfe": F5_NFE, "cfg": F5_CFG, "speed": F5_SPEED}
+        return {"motor": f"edge:{self.voz}"}
+
+
+# ================================================================== 3. LEGENDAR
 def format_ass_time(t: float) -> str:
-    h = int(t // 3600)
-    m = int((t % 3600) // 60)
-    s = int(t % 60)
-    cs = int(round((t - int(t)) * 100))
-    if cs >= 100:
-        cs = 99
+    h = int(t // 3600); m = int((t % 3600) // 60); s = int(t % 60)
+    cs = min(99, int(round((t - int(t)) * 100)))
     return f"{h:01d}:{m:02d}:{s:02d}.{cs:02d}"
+
 
 def reconciliar_palavras_com_pontuacao(words_timing: list, texto_original: str) -> list:
     """
@@ -175,6 +454,8 @@ def montar_chunks_naturais(words_timing: list, max_words: int = 7, max_chars: in
         else:
             chunks.append(cur)
     return chunks
+
+
 
 def gerar_ass_wordboundary(
     words_timing: list,
@@ -268,1182 +549,275 @@ def gerar_ass_wordboundary(
 
     return "\n".join(lines)
 
-# -------------------------------------------------------------
-# Extração Direta e Otimizada do PPTX (Somente Anotações)
-# -------------------------------------------------------------
-def _montar_item(i: int, img_path: pathlib.Path, notas: str, textos_shape: list) -> dict:
-    conteudo_base = notas.strip() if notas and notas.strip() else " ".join(textos_shape)
-    conteudo_normalizado = normalizar_para_fala(conteudo_base)
-    return {
-        "slide": i,
-        "imagem": str(img_path.name),
-        "texto_fala": conteudo_normalizado,
-        "texto_original": conteudo_base,
-        "texto_exibicao": conteudo_normalizado,
-    }
 
 
-def extrair_e_montar_roteiro_linux(
-    pptx_path: pathlib.Path,
-    slides_img_dir: pathlib.Path,
-    slides_filtro: list = None
-) -> list:
-    """Linux/macOS (cluster): LibreOffice headless -> PDF -> pdftoppm (PNG 1920x1080);
-    anotações do orador via python-pptx. Requer: libreoffice (soffice), poppler-utils, pip install python-pptx."""
-    from pptx import Presentation
-    import shutil
-
-    slides_img_dir.mkdir(parents=True, exist_ok=True)
-    pres = Presentation(str(pptx_path))
-    total_slides = len(pres.slides)
-    alvos = [s for s in range(1, total_slides + 1) if not slides_filtro or s in slides_filtro]
-    print(f"Apresentacao: {pptx_path.name} (Total: {total_slides} slides, preparando: {len(alvos)} slide(s)) [LibreOffice]...")
-
-    pptx_mtime = pptx_path.stat().st_mtime
-    faltam = [i for i in alvos
-              if not (slides_img_dir / f"slide_{i:03d}.png").exists()
-              or (slides_img_dir / f"slide_{i:03d}.png").stat().st_size == 0
-              or (slides_img_dir / f"slide_{i:03d}.png").stat().st_mtime < pptx_mtime]
-    if faltam:
-        soffice = shutil.which("soffice") or shutil.which("libreoffice")
-        if not soffice:
-            raise RuntimeError("LibreOffice (soffice) não encontrado no PATH. No cluster: module load libreoffice, "
-                               "ou instale com conda: mamba install -c conda-forge libreoffice poppler")
-        pdf_path = slides_img_dir / (pptx_path.stem + ".pdf")
-        if not pdf_path.exists() or pdf_path.stat().st_mtime < pptx_mtime:
-            print("  Convertendo PPTX -> PDF com LibreOffice (uma vez)...")
-            subprocess.run([soffice, "--headless", "--convert-to", "pdf", "--outdir", str(slides_img_dir), str(pptx_path)],
-                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
-            if not pdf_path.exists():
-                raise RuntimeError("LibreOffice não gerou o PDF.")
-        if not shutil.which("pdftoppm"):
-            raise RuntimeError("pdftoppm (poppler-utils) não encontrado. mamba install -c conda-forge poppler")
-        for i in faltam:
-            tmp_prefix = slides_img_dir / f"_tmp_{i:03d}"
-            subprocess.run(["pdftoppm", "-png", "-r", "144", "-f", str(i), "-l", str(i),
-                            "-scale-to-x", "1920", "-scale-to-y", "1080", str(pdf_path), str(tmp_prefix)],
-                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            gerados = sorted(slides_img_dir.glob(f"_tmp_{i:03d}*.png"))
-            if not gerados:
-                raise RuntimeError(f"pdftoppm não gerou a página {i}.")
-            gerados[0].replace(slides_img_dir / f"slide_{i:03d}.png")
-            for g in gerados[1:]:
-                g.unlink()
-            print(f"  Slide {i:03d} exportado para PNG.")
-    for i in alvos:
-        if i not in faltam:
-            print(f"  Slide {i:03d} (imagem ja existe em cache).")
-
-    roteiro = []
-    for i in alvos:
-        slide = pres.slides[i - 1]
-        img_path = slides_img_dir / f"slide_{i:03d}.png"
-        notas = ""
-        if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
-            notas = slide.notes_slide.notes_text_frame.text.strip()
-        textos_shape = [sh.text_frame.text.strip() for sh in slide.shapes
-                        if sh.has_text_frame and sh.text_frame.text.strip()]
-        roteiro.append(_montar_item(i, img_path, notas, textos_shape))
-    return roteiro
+# ================================================================== 4. RENDERIZAR
+def renderizar(img: pathlib.Path, wav: pathlib.Path, ass: pathlib.Path, mp4: pathlib.Path) -> subprocess.Popen:
+    """Dispara o ffmpeg em segundo plano (codificação na CPU sobreposta à síntese do próximo slide).
+    Entradas copiadas para disco local: o '-loop 1' relê o PNG a cada quadro."""
+    loc = {p: tmp_local(p.name) for p in (img, wav, ass)}
+    for p, l in loc.items(): shutil.copyfile(p, l)
+    ass_f = str(loc[ass]).replace("\\", "/").replace(":", "\\:")
+    saida = tmp_local(mp4.name)
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-framerate", str(FPS_CLIPE), "-i", str(loc[img]),
+           "-i", str(loc[wav]), "-vf", f"subtitles='{ass_f}'", "-r", str(FPS_CLIPE),
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-tune", "stillimage", "-threads", str(FFMPEG_THREADS),
+           "-c:a", "aac", "-b:a", "160k", "-pix_fmt", "yuv420p", "-shortest", str(saida)]
+    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    p._videoaula = (saida, mp4, list(loc.values()), time.time())
+    return p
 
 
-def extrair_e_montar_roteiro(
-    pptx_path: pathlib.Path,
-    slides_img_dir: pathlib.Path,
-    slides_filtro: list = None
-) -> list:
-    if sys.platform != "win32":
-        return extrair_e_montar_roteiro_linux(pptx_path, slides_img_dir, slides_filtro)
-    slides_img_dir.mkdir(parents=True, exist_ok=True)
-    import win32com.client
-
-    pptx_abs = str(pptx_path.resolve())
-    ppt_app = win32com.client.Dispatch("PowerPoint.Application")
-    roteiro = []
-    try:
-        pres = ppt_app.Presentations.Open(pptx_abs, ReadOnly=True, Untitled=False, WithWindow=False)
-        total_slides = pres.Slides.Count
-
-        alvos = [s for s in range(1, total_slides + 1) if not slides_filtro or s in slides_filtro]
-        print(f"Apresentacao: {pptx_path.name} (Total: {total_slides} slides, preparando: {len(alvos)} slide(s))...")
-
-        for i in alvos:
-            slide = pres.Slides(i)
-            img_path = slides_img_dir / f"slide_{i:03d}.png"
-
-            # Cache inteligente: reexporta imagem se não existir ou se o PPTX foi modificado depois
-            pptx_mtime = pptx_path.stat().st_mtime
-            if not img_path.exists() or img_path.stat().st_size == 0 or img_path.stat().st_mtime < pptx_mtime:
-                slide.Export(str(img_path), "PNG", 1920, 1080)
-                print(f"  Slide {i:03d} exportado para PNG.")
-            else:
-                print(f"  Slide {i:03d} (imagem ja existe em cache).")
-
-            # Extrai EXCLUSIVAMENTE o texto das anotações do orador
-            notas = ""
-            if slide.HasNotesPage:
-                for s in slide.NotesPage.Shapes:
-                    if s.HasTextFrame and s.TextFrame.HasText:
-                        txt = s.TextFrame.TextRange.Text.strip()
-                        # Ignora se for apenas o número da página
-                        if txt and not txt.isdigit():
-                            notas += " " + txt
-            notas = notas.strip()
-
-            # Se porventura o slide não tiver anotações, usa o texto do slide como fallback
-            if notas:
-                conteudo_base = notas
-            else:
-                textos_shape = []
-                for s in slide.Shapes:
-                    if s.HasTextFrame and s.TextFrame.HasText:
-                        t = s.TextFrame.TextRange.Text.strip()
-                        if t:
-                            textos_shape.append(t)
-                conteudo_base = " ".join(textos_shape)
-
-            conteudo_normalizado = normalizar_para_fala(conteudo_base)
-
-            roteiro.append({
-                "slide": i,
-                "imagem": str(img_path.name),
-                "texto_fala": conteudo_normalizado,
-                "texto_original": conteudo_base,
-                "texto_exibicao": conteudo_normalizado
-            })
-
-        pres.Close()
-    finally:
-        try:
-            ppt_app.Quit()
-        except Exception:
-            pass
-    return roteiro
-
-# -------------------------------------------------------------
-# Motor de Síntese com Clonagem de Voz (100% local)
-# -------------------------------------------------------------
-# Voz "reinaldo_haas": Chatterbox Multilingual (clonagem zero-shot a partir da
-#   amostra de referência) + whisperx para recuperar os tempos por palavra.
-# Vozes "antonio"/"francisca": edge-tts (nuvem Microsoft), mantido como fallback.
-#
-# Dependências extras:  pip install chatterbox-tts whisperx
-#
-AMOSTRA_REF_PADRAO = TOOL_DIR / "voz_referencia" / "amostra_nova.mp3"
-# Fonte das legendas: Segoe UI no Windows; no Linux (cluster) usa DejaVu Sans, que vem com o libass/fontconfig
-FONTE_LEGENDA = "Segoe UI" if sys.platform == "win32" else "DejaVu Sans"
-
-# Ajustes de clonagem (Chatterbox)
-CB_EXAGGERATION = 0.45      # 0.3 = mais neutro/didático, 0.7 = mais expressivo
-CB_CFG_WEIGHT = 0.4         # menor = mais fiel ao timbre da amostra
-CB_TEMPERATURE = 0.7
-PAUSA_ENTRE_FRASES = 0.35   # segundos de silêncio inserido entre frases
-WHISPERX_MODEL = "medium"   # "small" se a GPU for modesta; "large-v3" se sobrar VRAM
-
-# F5-TTS em português brasileiro (voz "reinaldo_f5") — modelo menor, rápido em GPUs de 4 GB
-F5_REPO = "traderpedroso/F5-TTS-BRAZILIAN-PORTUGUESE"
-F5_ARQUITETURAS = ("F5TTS_Base", "F5TTS_v1_Base")   # tenta nesta ordem
-F5_NFE_STEP = 32          # passos do flow matching: 16 = mais rápido, 48 = mais qualidade
-F5_CFG = 2.0              # força de guidance (1.5–2.5)
-F5_SPEED = 0.95           # ritmo da fala (1.0 = neutro; < 1 = mais pausado, bom para aula)
-F5_REF_MAX_S = 12         # F5 rende melhor com referência curta (8–12 s)
-
-VOZES_CLONADAS = ("reinaldo_haas", "reinaldo_f5")
-
-def _ambiente_ffmpeg() -> dict:
-    """Garante um cache de fontconfig persistente e gravável (sem isso, o filtro de legendas pode
-    reconstruir o cache de fontes a cada chamada do ffmpeg — dezenas de segundos por clipe)."""
-    env = os.environ.copy()
-    if sys.platform != "win32":
-        cache = pathlib.Path(env.get("XDG_CACHE_HOME", pathlib.Path.home() / ".cache")) / "fontconfig"
-        try:
-            cache.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-        env.setdefault("FONTCONFIG_CACHE", str(cache))
-    return env
+def concluir_render(p: subprocess.Popen):
+    saida, mp4, temporarios, t0 = p._videoaula
+    _, err = p.communicate()
+    if p.returncode != 0:
+        raise RuntimeError(f"ffmpeg falhou em {mp4.name}: {err.decode(errors='replace')[-300:]}")
+    shutil.move(str(saida), str(mp4))
+    for t in temporarios: pathlib.Path(t).unlink(missing_ok=True)
+    print(f"  clipe {mp4.name} pronto ({time.time()-t0:.0f}s)")
 
 
-# Renderização dos clipes (imagem parada + legendas)
-FPS_CLIPE = 10            # 10 fps: legendas palavra a palavra continuam precisas; 25 só encarece o x264
-FFMPEG_THREADS = 4        # por clipe; com --paralelo N o total é N*4
+def concatenar(clipes: list, saida: pathlib.Path):
+    lista = saida.with_suffix(".txt")
+    lista.write_text("".join(f"file '{str(c.resolve()).replace(chr(92), '/')}'\n" for c in clipes), encoding="utf-8")
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(lista),
+                    "-c", "copy", str(saida)], check=True)
+    lista.unlink()
+    print(f"\nVÍDEO GERADO: {saida}  ({saida.stat().st_size/1e6:.1f} MB)")
 
 
-def dividir_em_frases(texto: str) -> list:
-    """Quebra o texto em frases; clonagem zero-shot rende melhor em trechos curtos."""
-    partes = re.split(r'(?<=[.!?;:])\s+', texto.strip())
-    frases = []
-    for p in partes:
-        p = p.strip()
-        if not p:
-            continue
-        # Frases muito longas (> ~220 chars) são quebradas em vírgulas
-        if len(p) > 220:
-            sub = re.split(r'(?<=,)\s+', p)
-            buf = ""
-            for s in sub:
-                if len(buf) + len(s) > 220 and buf:
-                    frases.append(buf.strip())
-                    buf = s
-                else:
-                    buf = (buf + " " + s).strip()
-            if buf:
-                frases.append(buf.strip())
-        else:
-            frases.append(p)
-    return frases
-
-
-def _preencher_tempos_faltantes(palavras: list, total_dur: float) -> list:
-    """whisperx não marca tempo em alguns tokens (números, siglas); interpola."""
-    n = len(palavras)
-    out = [[w, s, e] for (w, s, e) in palavras]
-    for i in range(n):
-        if out[i][1] is not None and out[i][2] is not None:
-            continue
-        # Procura vizinho anterior e posterior com tempo
-        prev_e = 0.0
-        for j in range(i - 1, -1, -1):
-            if out[j][2] is not None:
-                prev_e = out[j][2]
-                break
-        next_s, k_next = total_dur, n
-        for j in range(i + 1, n):
-            if out[j][1] is not None:
-                next_s, k_next = out[j][1], j
-                break
-        # Quantas palavras sem tempo há neste buraco (inclusive esta)
-        j0 = i
-        while j0 > 0 and out[j0 - 1][1] is None:
-            j0 -= 1
-        n_gap = k_next - j0
-        passo = (next_s - prev_e) / max(n_gap, 1)
-        pos = i - j0
-        out[i][1] = prev_e + passo * pos
-        out[i][2] = prev_e + passo * (pos + 1)
-    return [(w, float(s), float(e)) for (w, s, e) in out]
-
-
-class MotorVoz:
-    def __init__(self, nome_voz: str = "reinaldo_haas", amostra_ref: pathlib.Path = None,
-                 cfg_weight: float = CB_CFG_WEIGHT, exaggeration: float = CB_EXAGGERATION,
-                 permitir_cpu: bool = False, usar_fp16: bool = False, alinhar_cpu: bool = False):
-        self.nome_voz = nome_voz
-        self.cfg_weight = cfg_weight
-        self.exaggeration = exaggeration
-        self.usar_fp16 = usar_fp16
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.tts = None
-        self.align_model = None
-        self.align_meta = None
-        self.ref_wav = None
-
-        self.sr = 24000
-        if nome_voz in VOZES_CLONADAS:
-            if self.device == "cpu" and not permitir_cpu:
-                raise RuntimeError(
-                    "GPU nao detectada (torch.cuda.is_available() == False). Na CPU cada slide leva ~10 min.\n"
-                    "  Verifique: python -c \"import torch; print(torch.__version__, torch.cuda.is_available())\"\n"
-                    "  Se sair '+cpu', reinstale o torch com CUDA (ex.: --index-url https://download.pytorch.org/whl/cu126).\n"
-                    "  Para rodar mesmo assim na CPU, use --permitir-cpu."
-                )
-            amostra = pathlib.Path(amostra_ref) if amostra_ref else AMOSTRA_REF_PADRAO
-            if not amostra.exists():
-                raise FileNotFoundError(f"Amostra de referência não encontrada: {amostra}")
-            self.ref_wav = self._preparar_referencia(amostra)
-            if sys.platform != "win32":
-                import tempfile, shutil as _sh
-                ref_loc = pathlib.Path(tempfile.gettempdir()) / f"videoaula_ref_{os.getpid()}.wav"
-                _sh.copyfile(self.ref_wav, ref_loc); self.ref_wav_origem = self.ref_wav; self.ref_wav = ref_loc
-
-            if nome_voz == "reinaldo_haas":
-                print(f"Carregando Chatterbox Multilingual ({self.device})...")
-                from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-                self.tts = ChatterboxMultilingualTTS.from_pretrained(device=self.device)
-                self.sr = self.tts.sr
-                # Codifica a amostra de referência uma única vez (por padrão o generate() refaz isso a cada frase)
-                try:
-                    self.tts.prepare_conditionals(str(self.ref_wav), exaggeration=exaggeration)
-                    self.conds_prontos = True
-                except Exception as e:
-                    print(f"  (prepare_conditionals indisponível: {str(e)[:60]} — referência será recodificada por frase)")
-                    self.conds_prontos = False
-            else:
-                self.ref_wav, self.ref_text = self._preparar_referencia_f5(getattr(self, "ref_wav_origem", self.ref_wav))
-                self._carregar_f5()
-
-            # Alinhamento roda na CPU de propósito: é barato e libera ~1,2 GB de VRAM para o Chatterbox.
-            # GPUs com pouca memória (<= 6 GB) caem em "memória compartilhada" do Windows e ficam 10x mais lentas.
-            vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if self.device == "cuda" else 0
-            self.align_device = "cuda" if (vram_gb >= 12 and not alinhar_cpu) else "cpu"
-            print(f"Carregando modelo de alinhamento whisperx (pt) na {self.align_device.upper()}...")
-            import whisperx
-            self.align_model, self.align_meta = whisperx.load_align_model(
-                language_code="pt", device=self.align_device
-            )
-            if nome_voz == "reinaldo_haas":
-                print(f"Voz clonada ativa (Chatterbox) a partir de: {amostra.name} (cfg={cfg_weight}, exag={exaggeration})")
-            else:
-                print(f"Voz clonada ativa (F5-TTS pt-BR) a partir de: {amostra.name}")
-                print(f"  Transcrição da referência: \"{self.ref_text[:100]}{'...' if len(self.ref_text) > 100 else ''}\"")
-
-    def assinatura(self) -> dict:
-        """Identifica o que gerou um áudio; se mudar (motor, amostra, parâmetros), o cache é invalidado."""
-        if self.nome_voz == "reinaldo_haas":
-            ref = pathlib.Path(getattr(self, "ref_wav_origem", self.ref_wav))
-            return {
-                "motor": "chatterbox-multilingual",
-                "amostra": ref.name,
-                "amostra_mtime": int(ref.stat().st_mtime),
-                "cfg_weight": round(self.cfg_weight, 3),
-                "exaggeration": round(self.exaggeration, 3),
-                "temperature": CB_TEMPERATURE,
-                "fp16": bool(self.usar_fp16),
-            }
-        if self.nome_voz == "reinaldo_f5":
-            ref = pathlib.Path(getattr(self, "ref_wav_origem", self.ref_wav))
-            return {
-                "motor": "f5-tts-ptbr",
-                "repo": F5_REPO,
-                "amostra": ref.name,
-                "amostra_mtime": int(ref.stat().st_mtime),
-                "ref_text": self.ref_text,
-                "nfe_step": F5_NFE_STEP,
-                "cfg": F5_CFG,
-                "speed": F5_SPEED,
-            }
-        return {"motor": f"edge-tts:{self.nome_voz}"}
-
-    # ---------------- F5-TTS ----------------
-    @staticmethod
-    def _preparar_referencia_f5(ref_wav: pathlib.Path):
-        """Recorta a referência (sem silêncio inicial, até F5_REF_MAX_S s) e obtém sua transcrição.
-        A transcrição fica em um .txt ao lado — EDITE-O se houver erros: o F5 depende dela."""
-        ref_wav = pathlib.Path(ref_wav)
-        clip = ref_wav.with_name(ref_wav.stem + f"_f5ref{F5_REF_MAX_S}s.wav")
-        txt = clip.with_suffix(".txt")
-        if not clip.exists() or clip.stat().st_mtime < ref_wav.stat().st_mtime:
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", str(ref_wav),
-                 "-af", "silenceremove=start_periods=1:start_threshold=-40dB:start_silence=0.2",
-                 "-t", str(F5_REF_MAX_S), "-ar", "24000", "-ac", "1", str(clip)],
-                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            if txt.exists():
-                txt.unlink()   # referência mudou -> transcrever de novo
-            print(f"Referência F5 recortada: {clip.name}")
-        if txt.exists() and txt.read_text(encoding="utf-8").strip():
-            return clip, txt.read_text(encoding="utf-8").strip()
-        print("Transcrevendo a referência (uma vez, faster-whisper 'small' na CPU)...")
-        from faster_whisper import WhisperModel
-        modelo = WhisperModel("small", device="cpu", compute_type="int8")
-        segs, _ = modelo.transcribe(str(clip), language="pt", beam_size=5)
-        texto = " ".join(s.text.strip() for s in segs).strip()
-        del modelo
-        txt.write_text(texto, encoding="utf-8")
-        print(f"  Transcrição salva em {txt.name} — confira e corrija se necessário.")
-        return clip, texto
-
-    def _carregar_f5(self):
-        """Localiza checkpoint e vocab do modelo pt-BR no cache do Hugging Face e carrega o F5-TTS."""
-        from huggingface_hub import snapshot_download
-        from f5_tts.api import F5TTS
-        pasta = pathlib.Path(snapshot_download(F5_REPO, local_files_only=(os.environ.get("HF_HUB_OFFLINE") == "1")))
-        ckpts = sorted(list(pasta.rglob("*.safetensors")) + list(pasta.rglob("*.pt")),
-                       key=lambda f: f.stat().st_size, reverse=True)
-        vocabs = list(pasta.rglob("vocab.txt"))
-        if not ckpts:
-            raise FileNotFoundError(f"Nenhum checkpoint (.safetensors/.pt) encontrado em {pasta}")
-        ckpt = str(ckpts[0])
-        vocab = str(vocabs[0]) if vocabs else ""
-        print(f"Carregando F5-TTS pt-BR ({self.device}): {ckpts[0].name}" + (f" + {vocabs[0].name}" if vocabs else ""))
-        erro = None
-        for arq in F5_ARQUITETURAS:
-            try:
-                self.tts = F5TTS(model=arq, ckpt_file=ckpt, vocab_file=vocab, device=self.device)
-                print(f"  Arquitetura: {arq}")
-                return
-            except Exception as e:
-                erro = e
-                print(f"  ({arq} não bateu: {str(e)[:90]}...)")
-        raise RuntimeError(f"Não foi possível carregar o F5-TTS com nenhuma arquitetura conhecida: {erro}")
-
-    def _gerar_frase_f5(self, frase: str):
-        import numpy as np
-        with torch.inference_mode():
-            wav, sr, _ = self.tts.infer(
-                ref_file=str(self.ref_wav), ref_text=self.ref_text, gen_text=frase,
-                nfe_step=F5_NFE_STEP, cfg_strength=F5_CFG, speed=F5_SPEED,
-                remove_silence=False, show_info=lambda *a, **k: None, progress=None,
-            )
-        self.sr = sr
-        t = torch.from_numpy(np.asarray(wav, dtype=np.float32))
-        return t.unsqueeze(0) if t.dim() == 1 else t
-
-    @staticmethod
-    def _preparar_referencia(amostra: pathlib.Path) -> pathlib.Path:
-        """Converte a amostra para wav mono 24 kHz (uma vez, com cache)."""
-        ref_wav = amostra.with_name(amostra.stem + "_ref24k.wav")
-        if not ref_wav.exists() or ref_wav.stat().st_mtime < amostra.stat().st_mtime:
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", str(amostra), "-ar", "24000", "-ac", "1",
-                 "-af", "loudnorm=I=-20:TP=-2", str(ref_wav)],
-                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            print(f"Referência preparada: {ref_wav.name}")
-        return ref_wav
-
-    # ---------------- clonagem local ----------------
-    def _sintetizar_clonado(self, texto_fala: str, audio_out_wav: pathlib.Path):
-        import torchaudio
-        pedacos = []
-        for frase in dividir_em_frases(texto_fala):
-            wav = self._gerar_frase_f5(frase) if self.nome_voz == "reinaldo_f5" else self._gerar_frase(frase)
-            pedacos.append(wav.cpu())
-            pedacos.append(torch.zeros(1, int(PAUSA_ENTRE_FRASES * self.sr)))
-        sr = self.sr
-        if pedacos:
-            pedacos.pop()  # remove o silêncio final
-        audio = torch.cat(pedacos, dim=1)
-        if self.device == "cuda":
-            torch.cuda.empty_cache()
-        # Normaliza volume para consistência entre slides
-        pico = audio.abs().max().clamp(min=1e-6)
-        audio = audio / pico * 0.9
-        torchaudio.save(str(audio_out_wav), audio, sr)
-        return audio.shape[1] / sr
-
-    def _gerar_frase(self, frase: str):
-        """Gera uma frase; em GPU tenta precisão mista (fp16) para ganhar velocidade e VRAM,
-        e cai para fp32 automaticamente se o modelo reclamar."""
-        kwargs = dict(language_id="pt", exaggeration=self.exaggeration, cfg_weight=self.cfg_weight,
-                      temperature=CB_TEMPERATURE)
-        if not getattr(self, "conds_prontos", False):
-            kwargs["audio_prompt_path"] = str(self.ref_wav)
-        if self.device == "cuda" and self.usar_fp16:
-            try:
-                with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
-                    return self.tts.generate(frase, **kwargs)
-            except Exception as e:
-                print(f"  (fp16 falhou: {str(e)[:80]}... usando fp32 daqui em diante)")
-                self.usar_fp16 = False
-                torch.cuda.empty_cache()
-        with torch.inference_mode():
-            return self.tts.generate(frase, **kwargs)
-
-    def _alinhar_palavras(self, texto_fala: str, audio_wav: pathlib.Path, total_dur: float) -> list:
-        """Alinhamento forçado: o texto é conhecido, só recuperamos os tempos."""
-        import whisperx
-        audio = whisperx.load_audio(str(audio_wav))
-        segmentos = [{"text": texto_fala, "start": 0.0, "end": total_dur}]
-        resultado = whisperx.align(
-            segmentos, self.align_model, self.align_meta, audio, self.align_device,
-            return_char_alignments=False
-        )
-        palavras = []
-        for w in resultado.get("word_segments", []):
-            palavras.append((w.get("word", "").strip(), w.get("start"), w.get("end")))
-        palavras = [p for p in palavras if p[0]]
-        if not palavras:
-            # Fallback: distribui as palavras uniformemente
-            toks = texto_fala.split()
-            passo = total_dur / max(len(toks), 1)
-            return [(t, i * passo, (i + 1) * passo) for i, t in enumerate(toks)]
-        return _preencher_tempos_faltantes(palavras, total_dur)
-
-    # ---------------- fallback edge-tts ----------------
-    async def _sintetizar_edge(self, texto_fala: str, audio_out_wav: pathlib.Path, work_dir: pathlib.Path):
-        import edge_tts
-        voice_base = "pt-BR-FranciscaNeural" if self.nome_voz == "francisca" else "pt-BR-AntonioNeural"
-        c = edge_tts.Communicate(texto_fala, voice_base, boundary="WordBoundary")
-        audio_data = bytearray()
-        words_timing = []
-        async for chunk in c.stream():
-            if chunk["type"] == "audio":
-                audio_data.extend(chunk["data"])
-            elif chunk["type"] == "WordBoundary":
-                start = chunk["offset"] / 10_000_000.0
-                dur = chunk["duration"] / 10_000_000.0
-                words_timing.append((chunk["text"], start, start + dur))
-        raw_mp3 = work_dir / "temp_tts_base.mp3"
-        with open(raw_mp3, "wb") as f:
-            f.write(audio_data)
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(raw_mp3), "-ar", "24000", "-ac", "1", str(audio_out_wav)],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        return words_timing
-
-    # ---------------- interface usada pelo pipeline ----------------
-    async def sintetizar_slide(self, texto_fala: str, audio_out_wav: pathlib.Path, work_dir: pathlib.Path):
-        if self.nome_voz in VOZES_CLONADAS:
-            import tempfile, shutil as _sh
-            tmp_wav = pathlib.Path(tempfile.gettempdir()) / f"videoaula_{os.getpid()}_{audio_out_wav.name}"
-            t1 = time.time()
-            total_dur = self._sintetizar_clonado(texto_fala, tmp_wav)
-            t2 = time.time()
-            words_timing = self._alinhar_palavras(texto_fala, tmp_wav, total_dur)
-            t3 = time.time()
-            _sh.copyfile(tmp_wav, audio_out_wav)
-            try: tmp_wav.unlink()
-            except Exception: pass
-            print(f"  [tempos] síntese {t2-t1:.1f}s | alinhamento {t3-t2:.1f}s | áudio {total_dur:.1f}s")
-            return total_dur, words_timing
-
-        words_timing = await self._sintetizar_edge(texto_fala, audio_out_wav, work_dir)
-        res = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(audio_out_wav)],
-            capture_output=True, text=True, check=True
-        )
-        return float(res.stdout.strip()), words_timing
-
-
-    async def obter_timing_rapido(self, texto_fala: str, audio_out_wav: pathlib.Path):
-        """Recupera só os tempos por palavra de um áudio já sintetizado (cache), sem ressintetizar."""
-        res = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(audio_out_wav)],
-            capture_output=True, text=True, check=True
-        )
-        total_dur = float(res.stdout.strip())
-        if self.nome_voz in VOZES_CLONADAS:
-            import tempfile, shutil as _sh
-            tmp_wav = pathlib.Path(tempfile.gettempdir()) / f"videoaula_{os.getpid()}_{audio_out_wav.name}"
-            _sh.copyfile(audio_out_wav, tmp_wav)
-            try:
-                return total_dur, self._alinhar_palavras(texto_fala, tmp_wav, total_dur)
-            finally:
-                try: tmp_wav.unlink()
-                except Exception: pass
-        # edge-tts: reconsulta apenas os WordBoundary (rápido, sem baixar áudio novo)
-        import edge_tts
-        voice_base = "pt-BR-FranciscaNeural" if self.nome_voz == "francisca" else "pt-BR-AntonioNeural"
-        c = edge_tts.Communicate(texto_fala, voice_base, boundary="WordBoundary")
-        words_timing = []
-        async for chunk in c.stream():
-            if chunk["type"] == "WordBoundary":
-                start = chunk["offset"] / 10_000_000.0
-                dur = chunk["duration"] / 10_000_000.0
-                words_timing.append((chunk["text"], start, start + dur))
-        return total_dur, words_timing
-
-# -------------------------------------------------------------
-# Pipeline Principal
-# -------------------------------------------------------------
-async def executar(
-    pptx_path: pathlib.Path,
-    roteiro_path: pathlib.Path = None,
-    nome_voz: str = "reinaldo_haas",
-    amostra_ref: pathlib.Path = None,
-    saida_video: pathlib.Path = None,
-    slides_filtro: list = None,
-    aviso_inicio: str = None,
-    aviso_fim: str = None,
-    duracao_aviso: float = 5.0,
-    cfg_weight: float = CB_CFG_WEIGHT,
-    exaggeration: float = CB_EXAGGERATION,
-    permitir_cpu: bool = False,
-    usar_fp16: bool = False,
-    alinhar_cpu: bool = False,
-    offset_sincronia: float = -0.12,
-    forcar: bool = False,
-    so_clipes: bool = False,          # trabalhador paralelo: gera clipes e não concatena
-    banner_primeiro: int = None,      # nº global do primeiro/último slide (para o aviso de topo nos trabalhadores)
-    banner_ultimo: int = None
-):
-    work_dir = pptx_path.resolve().parent / "video_work" / pptx_path.stem
-    work_dir.mkdir(parents=True, exist_ok=True)
-    slides_img_dir = work_dir / "slides_img"
-    audio_dir = work_dir / "audio"
-    subs_dir = work_dir / "legendas"
-    clips_dir = work_dir / "clipes"
-
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    subs_dir.mkdir(parents=True, exist_ok=True)
-    clips_dir.mkdir(parents=True, exist_ok=True)
-
-    if roteiro_path and roteiro_path.exists():
-        print(f"Usando roteiro customizado: {roteiro_path}")
-        with open(roteiro_path, "r", encoding="utf-8-sig") as f:
-            roteiro = json.load(f)
-        if slides_filtro:
-            roteiro = [it for it in roteiro if it["slide"] in slides_filtro]
-        # Exporta apenas as imagens que faltam, e só dos slides que serão renderizados
-        faltantes = [it["slide"] for it in roteiro
-                     if not (slides_img_dir / f"slide_{it['slide']:03d}.png").exists()]
-        if faltantes:
-            print(f"Exportando imagens faltantes dos slides: {faltantes}")
-            extrair_e_montar_roteiro(pptx_path, slides_img_dir, slides_filtro=faltantes)
+# ================================================================== PIPELINE
+def carregar_roteiro(pptx, work, roteiro_path, slides):
+    img_dir = work / "slides_img"
+    if roteiro_path:
+        roteiro = json.loads(pathlib.Path(roteiro_path).read_text(encoding="utf-8-sig"))
+        if slides: roteiro = [r for r in roteiro if r["slide"] in slides]
+        faltam = [r["slide"] for r in roteiro if _precisa_png(img_dir / f"slide_{r['slide']:03d}.png", pptx)]
+        if faltam: extrair(pptx, img_dir, faltam)
     else:
-        roteiro = extrair_e_montar_roteiro(pptx_path, slides_img_dir, slides_filtro=slides_filtro)
+        roteiro = extrair(pptx, img_dir, slides)
+        (work / "roteiro_gerado_automaticamente.json").write_text(
+            json.dumps(roteiro, indent=2, ensure_ascii=False), encoding="utf-8")
+    return [r for r in roteiro if r.get("texto_fala", "").strip()]
 
-    if not roteiro:
-        print("Aviso: Nenhum slide selecionado para renderização.")
-        return
 
-    primeiro_slide_num = roteiro[0]["slide"]
-    ultimo_slide_num = roteiro[-1]["slide"]
-    slide_aviso_inicio = banner_primeiro if banner_primeiro is not None else primeiro_slide_num
-    slide_aviso_fim = banner_ultimo if banner_ultimo is not None else ultimo_slide_num
+async def processar(pptx: pathlib.Path, roteiro: list, voz: Sintetizador, a, banner_ini: int, banner_fim: int) -> list:
+    """Para cada slide: cache -> síntese -> legenda -> render. Devolve os clipes na ordem do roteiro."""
+    work = pptx.parent / "video_work" / pptx.stem
+    for d in ("audio", "legendas", "clipes"): (work / d).mkdir(parents=True, exist_ok=True)
+    ass_atual = voz.assinatura()
+    clipes, renders = [], []
+    for r in roteiro:
+        n, texto = r["slide"], r["texto_fala"].strip()
+        wav, meta = work / "audio" / f"slide_{n:03d}.wav", work / "audio" / f"slide_{n:03d}.json"
+        ass, img, mp4 = work / "legendas" / f"slide_{n:03d}.ass", work / "slides_img" / f"slide_{n:03d}.png", work / "clipes" / f"clip_{n:03d}.mp4"
+        print(f"\n[Slide {n:03d}] {texto[:80]}...")
 
-    gpu = torch.cuda.is_available()
-    print(f"CPUs utilizáveis: {_N_CPU} (threads torch: {torch.get_num_threads()})")
-    if gpu:
-        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-        if vram_gb < 6:
-            print(f"Aviso: GPU com {vram_gb:.1f} GB de VRAM. Se a sintese ficar lenta (< 10 it/s), a memoria esta "
-                  f"estourando para a RAM. Feche outros programas que usem a GPU (navegador, PowerPoint com aceleracao).")
-    print(f"\nIniciando sintese e renderizacao ({len(roteiro)} slides: {primeiro_slide_num} a {ultimo_slide_num}, "
-          f"voz '{nome_voz}', dispositivo: {'GPU ' + torch.cuda.get_device_name(0) if gpu else 'CPU'})...")
-    try:
-        motor = MotorVoz(nome_voz, amostra_ref=amostra_ref, cfg_weight=cfg_weight,
-                         exaggeration=exaggeration, permitir_cpu=permitir_cpu, usar_fp16=usar_fp16,
-                         alinhar_cpu=alinhar_cpu)
-    except RuntimeError as e:
-        if "GPU nao detectada" in str(e):
-            print(f"\nERRO: {e}")
-            return
-        raise
-    except Exception as e:
-        msg = str(e)
-        if os.environ.get("HF_HUB_OFFLINE") == "1" and any(
-            k in msg for k in ("offline", "Offline", "cache", "Cannot find", "not found", "LocalEntryNotFound", "connection")
-        ):
-            print("\nERRO: um modelo não está no cache local e o script está em modo offline.")
-            print("Rode UMA vez com --online para baixar os modelos; nas próximas execuções não precisa mais.")
-            print(f"Detalhe: {msg[:300]}")
-            return
-        raise
-
-    clipes_gerados = []
-    renders_pendentes = []
-    for item in roteiro:
-        s_num = item["slide"]
-        texto_fala = item.get("texto_fala", "").strip()
-        texto_original = item.get("texto_original", texto_fala).strip()
-
-        if not texto_fala:
-            continue
-
-        print(f"\n[Slide {s_num:03d}]")
-        print(f"  Anotações do PPT: {texto_fala[:90]}...")
-
-        audio_wav = audio_dir / f"slide_{s_num:03d}.wav"
-        ass_path = subs_dir / f"slide_{s_num:03d}.ass"
-        words_json = subs_dir / f"slide_{s_num:03d}_words.json"
-        clip_mp4 = clips_dir / f"clip_{s_num:03d}.mp4"
-        img_path = slides_img_dir / f"slide_{s_num:03d}.png"
-
-        # Cache seguro: o áudio só é reaproveitado se foi gerado com o MESMO texto,
-        # MESMO motor de voz, MESMA amostra e MESMOS parâmetros. Qualquer diferença regenera.
-        # Áudios sem metadados (gerados por versões antigas do script) são sempre regenerados.
-        assinatura_atual = motor.assinatura()
-        dados_cache = None
-        motivo = None
-        if not audio_wav.exists() or audio_wav.stat().st_size <= 1000:
-            motivo = "sem áudio"
-        elif not words_json.exists():
-            motivo = "áudio sem metadados (versão antiga do script)"
-        else:
+        # ---- cache: mesmo texto, mesmo motor/amostra/parâmetros ----
+        dados = None
+        if not a.forcar and wav.exists() and meta.exists():
             try:
-                with open(words_json, "r", encoding="utf-8") as f:
-                    dados_cache = json.load(f)
-                if dados_cache.get("texto_fala") != texto_fala:
-                    motivo = "texto das anotações alterado no PPTX"
-                elif dados_cache.get("assinatura") != assinatura_atual:
-                    motivo = "motor de voz, amostra ou parâmetros diferentes"
-            except Exception:
-                motivo = "metadados ilegíveis"
-        if forcar:
-            motivo = "--forcar"
-
-        t0 = time.time()
-        if motivo is None:
-            dur = dados_cache["dur"]
-            words_timing = dados_cache["words_timing"]
-            print(f"  Áudio em cache ({dur:.2f}s). Atualizando legendas e clipe...")
-        else:
-            print(f"  Sintetizando áudio ({motivo})...")
-            dur, words_timing = await motor.sintetizar_slide(texto_fala, audio_wav, work_dir)
-            with open(words_json, "w", encoding="utf-8") as f:
-                json.dump({"dur": dur, "texto_fala": texto_fala, "words_timing": words_timing,
-                           "assinatura": assinatura_atual}, f, ensure_ascii=False)
-            print(f"  Áudio sintetizado: {dur:.2f}s (processado em {time.time()-t0:.2f}s)")
-
-        banner_topo = None
-        if s_num == slide_aviso_inicio and aviso_inicio:
-            banner_topo = aviso_inicio
-        elif s_num == slide_aviso_fim and aviso_fim:
-            banner_topo = aviso_fim
-
-        ass_content = gerar_ass_wordboundary(
-            words_timing=words_timing,
-            texto_original=texto_original,
-            chunk_size=7,
-            aviso_topo=banner_topo,
-            duracao_aviso=duracao_aviso,
-            total_dur=dur,
-            offset_sincronia=offset_sincronia
-        )
-        ass_path.write_text(ass_content, encoding="utf-8")
-
-        clean_ass = str(ass_path).replace("\\", "/").replace(":", "\\:")
-        # Imagem parada + legendas: 10 fps bastam (destaque de palavras com resolução de 0,1 s) e cortam
-        # o custo do x264 em ~2,5x; preset veryfast + threads limitadas para conviver com trabalhadores paralelos.
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-loop", "1", "-framerate", str(FPS_CLIPE),
-            "-i", str(img_path),
-            "-i", str(audio_wav),
-            "-vf", f"subtitles='{clean_ass}'",
-            "-r", str(FPS_CLIPE),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-            "-tune", "stillimage",
-            "-threads", str(FFMPEG_THREADS),
-            "-c:a", "aac", "-b:a", "160k",
-            "-pix_fmt", "yuv420p",
-            "-shortest",
-            str(clip_mp4)
-        ]
-        t_ff = time.time()
-        import tempfile, shutil as _sh
-        # Entradas e saída em disco LOCAL: o "-loop 1" relê o PNG a cada quadro e o /home de um cluster
-        # (NFS/FUSE) pode levar minutos nisso; copiar uma vez para /tmp resolve.
-        tmpd = pathlib.Path(tempfile.gettempdir()) / f"videoaula_{os.getpid()}"
-        tmpd.mkdir(exist_ok=True)
-        img_loc = tmpd / img_path.name; wav_loc = tmpd / audio_wav.name; ass_loc = tmpd / ass_path.name
-        _sh.copyfile(img_path, img_loc); _sh.copyfile(audio_wav, wav_loc); _sh.copyfile(ass_path, ass_loc)
-        tmp_mp4 = tmpd / clip_mp4.name
-        cmd[cmd.index(str(img_path))] = str(img_loc)
-        cmd[cmd.index(str(audio_wav))] = str(wav_loc)
-        cmd[cmd.index("-vf") + 1] = f"subtitles='{str(ass_loc).replace(chr(92), '/').replace(':', chr(92) + ':')}'"
-        cmd[-1] = str(tmp_mp4)
-        # ffmpeg em segundo plano: a codificação (CPU) se sobrepõe à síntese do próximo slide (GPU)
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=_ambiente_ffmpeg())
-        renders_pendentes.append((proc, s_num, tmp_mp4, clip_mp4, (img_loc, wav_loc, ass_loc), t_ff))
-        clipes_gerados.append(clip_mp4)
-        # Não deixa acumular mais que 2 codificações por trabalhador
-        while len([r for r in renders_pendentes if r[0].poll() is None]) > 2:
-            time.sleep(0.5)
-        _finalizar_renders(renders_pendentes, apenas_concluidos=True)
-
-    _finalizar_renders(renders_pendentes, apenas_concluidos=False)
-
-    if not clipes_gerados:
-        print("Erro: Nenhum clipe gerado.")
-        return
-
-    if so_clipes:
-        print(f"\n[trabalhador] {len(clipes_gerados)} clipe(s) prontos: slides {primeiro_slide_num}-{ultimo_slide_num}")
-        return
-
-    concatenar_clipes(pptx_path, work_dir, clipes_gerados, saida_video, slides_filtro, primeiro_slide_num, ultimo_slide_num)
-
-
-def _finalizar_renders(pendentes: list, apenas_concluidos: bool):
-    """Recolhe ffmpegs em segundo plano: move o mp4 de /tmp para o destino e limpa as cópias locais."""
-    import shutil as _sh
-    restantes = []
-    for proc, s_num, tmp_mp4, clip_mp4, locais, t_ff in pendentes:
-        if apenas_concluidos and proc.poll() is None:
-            restantes.append((proc, s_num, tmp_mp4, clip_mp4, locais, t_ff)); continue
-        _, err = proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"ffmpeg falhou no slide {s_num}: {err.decode(errors='replace')[-400:]}")
-        _sh.move(str(tmp_mp4), str(clip_mp4))
-        for f in locais:
-            try: f.unlink()
+                d = json.loads(meta.read_text(encoding="utf-8"))
+                if d.get("texto_fala") == texto and d.get("assinatura") == ass_atual: dados = d
             except Exception: pass
-        print(f"  Clipe {s_num:03d} renderizado em {time.time()-t_ff:.1f}s (em segundo plano)")
-    pendentes[:] = restantes
-
-
-def concatenar_clipes(pptx_path, work_dir, clipes_gerados, saida_video, slides_filtro, primeiro_slide_num, ultimo_slide_num):
-    concat_txt = work_dir / "concat_list.txt"
-    with open(concat_txt, "w", encoding="utf-8") as f:
-        for c in clipes_gerados:
-            clean_p = str(c.resolve()).replace("\\", "/")
-            f.write(f"file '{clean_p}'\n")
-
-    # Salva sempre na pasta 'video'
-    if not saida_video:
-        pasta_destino = pptx_path.resolve().parent / "video"
-        if not pasta_destino.exists():
-            pasta_destino = pptx_path.resolve().parent / "videos"
-        pasta_destino.mkdir(parents=True, exist_ok=True)
-
-        if len(clipes_gerados) == 1 and slides_filtro and len(slides_filtro) == 1:
-            saida_video = pasta_destino / f"{pptx_path.stem}_slide_{primeiro_slide_num:03d}.mp4"
-        elif slides_filtro:
-            saida_video = pasta_destino / f"{pptx_path.stem}_slides_{primeiro_slide_num}_a_{ultimo_slide_num}.mp4"
+        if dados:
+            dur, palavras = dados["dur"], dados["words_timing"]
+            print(f"  áudio em cache ({dur:.1f}s)")
         else:
-            saida_video = pasta_destino / f"{pptx_path.stem}.mp4"
+            dur, palavras = await voz.sintetizar(texto, wav)
+            meta.write_text(json.dumps({"dur": dur, "texto_fala": texto, "words_timing": palavras,
+                                        "assinatura": ass_atual}, ensure_ascii=False), encoding="utf-8")
 
-    print(f"\nConcatenando todos os clipes em:\n{saida_video}...")
-    cmd_concat = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", str(concat_txt),
-        "-c", "copy",
-        str(saida_video)
-    ]
-    subprocess.run(cmd_concat, check=True)
-    print("\n=======================================================")
-    print("VÍDEO DA AULA GERADO COM SUCESSO:")
-    print(f"Arquivo: {saida_video}")
-    print(f"Tamanho: {saida_video.stat().st_size} bytes")
-    print("=======================================================")
+        banner = a.aviso_inicio if n == banner_ini else a.aviso_fim if n == banner_fim else None
+        ass.write_text(gerar_ass_wordboundary(palavras, r.get("texto_original", texto), 7, banner,
+                                              a.duracao_aviso, dur, a.offset), encoding="utf-8")
+        renders.append(renderizar(img, wav, ass, mp4)); clipes.append(mp4)
+        while sum(p.poll() is None for p in renders) > 2: time.sleep(0.5)
+        for p in [p for p in renders if p.poll() is not None]: concluir_render(p); renders.remove(p)
+    for p in renders: concluir_render(p)
+    return clipes
 
-# -------------------------------------------------------------
-# Escolha automática da GPU em nó compartilhado
-# -------------------------------------------------------------
-def quadro_gpus(leituras: int = 2, intervalo: float = 3.0) -> dict:
-    """{indice: (gb_livres_min, util_max)} ao longo de `leituras` consultas ao nvidia-smi."""
+
+def saida_padrao(pptx: pathlib.Path, roteiro: list, filtrado: bool) -> pathlib.Path:
+    d = pptx.parent / "video"; d.mkdir(exist_ok=True)
+    a, b = roteiro[0]["slide"], roteiro[-1]["slide"]
+    return d / (f"{pptx.stem}.mp4" if not filtrado else f"{pptx.stem}_slides_{a}_a_{b}.mp4")
+
+
+# ================================================================== GPUs e PARALELO
+def quadro_gpus(leituras=2, intervalo=3.0) -> dict:
+    """{indice: (gb_livres, util_%)} — mínimo de livres e máximo de uso ao longo das leituras."""
     def ler():
         out = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.free,utilization.gpu",
                               "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=20).stdout
         return {int(i): (float(f) / 1024, int(u)) for i, f, u in (l.split(",") for l in out.strip().splitlines())}
-    lidas = [ler()]
-    for _ in range(leituras - 1):
-        time.sleep(intervalo); lidas.append(ler())
-    return {i: (min(l[i][0] for l in lidas), max(l[i][1] for l in lidas)) for i in lidas[0]}
+    ls = [ler()]
+    for _ in range(leituras - 1): time.sleep(intervalo); ls.append(ler())
+    return {i: (min(l[i][0] for l in ls), max(l[i][1] for l in ls)) for i in ls[0]}
 
 
-def escolher_gpu(pedido: str = "auto", min_livre_gb: float = 8.0, leituras: int = 2, intervalo: float = 3.0):
-    """Define CUDA_VISIBLE_DEVICES antes de qualquer uso de CUDA.
-    pedido: 'auto' (placa mais ociosa com memória livre), um índice ('3'), ou 'todas' (não mexe)."""
-    if pedido == "todas":
-        return
-    if pedido != "auto":
-        os.environ["CUDA_VISIBLE_DEVICES"] = pedido
-        print(f"GPU fixada: {pedido}")
-        return
-    if os.environ.get("CUDA_VISIBLE_DEVICES"):
-        print(f"GPU (do ambiente): {os.environ['CUDA_VISIBLE_DEVICES']}")
-        return
-    try:
-        def ler():
-            out = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.free,utilization.gpu",
-                                  "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=20).stdout
-            return {int(i): (float(f) / 1024, int(u)) for i, f, u in (l.split(",") for l in out.strip().splitlines())}
-        lidas = [ler()]
-        if len(lidas[0]) <= 1:
-            return                                   # uma GPU só: nada a escolher
-        for _ in range(leituras - 1):
-            time.sleep(intervalo); lidas.append(ler())
-        placas = []
-        for i in lidas[0]:
-            livre = min(l[i][0] for l in lidas); util = max(l[i][1] for l in lidas)
-            placas.append((util, -livre, i, livre))
-        placas.sort()
-        print("GPUs: " + "  ".join(f"[{i}] {livre:.0f}GB livres/{util}%" for util, _, i, livre in sorted(placas, key=lambda x: x[2])))
-        candidatas = [p for p in placas if p[3] >= min_livre_gb]
-        if not candidatas:
-            print(f"Aviso: nenhuma GPU com >= {min_livre_gb:.0f} GB livres; usando a mais ociosa mesmo assim.")
-            candidatas = placas
-        util, _, idx, livre = candidatas[0]
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(idx)
-        print(f"GPU escolhida: {idx} ({livre:.0f} GB livres, {util}% de uso)")
-    except Exception as e:
-        print(f"(não foi possível consultar nvidia-smi: {str(e)[:60]}; usando a GPU padrão)")
+def escolher_gpu(pedido: str):
+    """Define CUDA_VISIBLE_DEVICES: 'auto' = placa mais ociosa com >= 8 GB livres; índice fixa; 'todas' não mexe."""
+    if pedido == "todas": return
+    if pedido != "auto": os.environ["CUDA_VISIBLE_DEVICES"] = pedido; return
+    if os.environ.get("CUDA_VISIBLE_DEVICES"): return
+    try: q = quadro_gpus()
+    except Exception: return
+    if len(q) <= 1: return
+    print("GPUs: " + "  ".join(f"[{i}] {g[0]:.0f}GB livres/{g[1]}%" for i, g in sorted(q.items())))
+    cand = [(u, -l, i) for i, (l, u) in q.items() if l >= 8] or [(u, -l, i) for i, (l, u) in q.items()]
+    i = sorted(cand)[0][2]
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(i); print(f"GPU escolhida: {i}")
 
 
-# -------------------------------------------------------------
-# Modo paralelo: N trabalhadores na mesma GPU, cada um com uma fatia dos slides
-# -------------------------------------------------------------
-def executar_paralelo(args, pptx_path: pathlib.Path, slides_filtro: list, n: int):
-    """O Chatterbox gera um token por vez e usa só uma fração de uma GPU grande; N processos
-    em paralelo dão speedup quase linear até saturar a placa (~3,5 GB de VRAM por trabalhador)."""
-    work_dir = pptx_path.resolve().parent / "video_work" / pptx_path.stem
-    work_dir.mkdir(parents=True, exist_ok=True)
-    slides_img_dir = work_dir / "slides_img"
-
-    # 0) Trava: não iniciar se já há trabalhadores deste PPTX rodando (disputariam a GPU e estourariam a VRAM)
-    if sys.platform != "win32":
-        try:
-            ps = subprocess.run(["pgrep", "-f", f"gerador_de_video_e_som.py.*{re.escape(pptx_path.name)}.*--so-clipes"],
-                                capture_output=True, text=True).stdout.split()
-            ps = [q for q in ps if int(q) != os.getpid()]
-            if ps:
-                print(f"ERRO: já existem {len(ps)} trabalhador(es) desta apresentação em execução (PIDs {' '.join(ps)}).")
-                print("  Acompanhe no terminal original ou encerre com:  pkill -f gerador_de_video_e_som.py")
-                return
-        except Exception:
-            pass
-
-    # 0b) Plano de GPUs. Sem o serviço MPS da NVIDIA, vários processos numa MESMA placa se revezam a cada
-    # kernel e um modelo autorregressivo quase não ganha com isso; o ganho real vem de usar VÁRIAS placas.
-    VRAM_POR_TRABALHADOR_GB = 6.0          # Chatterbox + whisperx (GPU) + buffers
-    MAX_POR_GPU = args.por_gpu
-    slots = []                                        # lista de índices de GPU, um por trabalhador
-    fixo = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if args.gpu not in ("auto", "todas"):
-        fixo = args.gpu
-    try:
-        quadro = quadro_gpus()
-    except Exception:
-        quadro = {}
-    if fixo:
-        idx = [int(x) for x in fixo.split(",") if x.strip().isdigit()]
-        for i in idx:
-            livre = quadro.get(i, (999, 0))[0]
-            slots += [i] * max(1, min(MAX_POR_GPU, int(livre / VRAM_POR_TRABALHADOR_GB)))
-    elif quadro:
-        print("GPUs: " + "  ".join(f"[{i}] {g[0]:.0f}GB livres/{g[1]}%" for i, g in sorted(quadro.items())))
-        ociosas = [(u, -l, i) for i, (l, u) in quadro.items() if u <= args.gpu_util_max and l >= VRAM_POR_TRABALHADOR_GB]
-        for _, _, i in sorted(ociosas):
-            livre = quadro[i][0]
-            slots += [i] * min(MAX_POR_GPU, int(livre / VRAM_POR_TRABALHADOR_GB))
-        if not slots:
-            print("Nenhuma GPU ociosa com memória livre; usando a menos carregada com 1 trabalhador.")
-            i = sorted((u, -l, i) for i, (l, u) in quadro.items())[0][2]
-            slots = [i]
-    if not slots:
-        slots = [None]                                # sem nvidia-smi: deixa o ambiente decidir
-    # Intercala as placas para que os primeiros N slots cubram o máximo de GPUs distintas
-    por_gpu = {}
-    for s in slots:
-        por_gpu.setdefault(s, []).append(s)
-    intercalado = []
-    while any(por_gpu.values()):
-        for g in list(por_gpu):
-            if por_gpu[g]:
-                intercalado.append(por_gpu[g].pop())
-    slots = intercalado
-    if n > len(slots):
-        print(f"Aviso: --paralelo {n} -> {len(slots)} trabalhador(es), limitado por GPUs ociosas/VRAM "
-              f"(máx. {MAX_POR_GPU} por placa; ajuste com --por-gpu).")
-        n = len(slots)
-    slots = slots[:n]
-
-    # 1) Roteiro e imagens, uma única vez, no processo pai (evita corrida no LibreOffice/PowerPoint)
-    if args.roteiro and pathlib.Path(args.roteiro).exists():
-        roteiro_path = pathlib.Path(args.roteiro).resolve()
-        with open(roteiro_path, "r", encoding="utf-8-sig") as f:
-            roteiro = json.load(f)
-        faltantes = [it["slide"] for it in roteiro
-                     if (not slides_filtro or it["slide"] in slides_filtro)
-                     and not (slides_img_dir / f"slide_{it['slide']:03d}.png").exists()]
-        if faltantes:
-            extrair_e_montar_roteiro(pptx_path, slides_img_dir, slides_filtro=faltantes)
-    else:
-        roteiro = extrair_e_montar_roteiro(pptx_path, slides_img_dir, slides_filtro=slides_filtro)
-        roteiro_path = work_dir / "roteiro_gerado_automaticamente.json"
-        with open(roteiro_path, "w", encoding="utf-8") as f:
-            json.dump(roteiro, f, indent=2, ensure_ascii=False)
-    if slides_filtro:
-        roteiro = [it for it in roteiro if it["slide"] in slides_filtro]
-    roteiro = [it for it in roteiro if it.get("texto_fala", "").strip()]
-    if not roteiro:
-        print("Aviso: nenhum slide com texto para sintetizar."); return
+def paralelo(a, pptx: pathlib.Path, roteiro: list, roteiro_path: pathlib.Path, slides: list):
+    """N trabalhadores espalhados pelas GPUs ociosas (máx. --por-gpu por placa: sem MPS, processos na
+    MESMA placa se revezam e um modelo autorregressivo ganha pouco). O pai só concatena."""
+    work = pptx.parent / "video_work" / pptx.stem
+    if not WINDOWS:
+        outros = [p for p in subprocess.run(["pgrep", "-f", f"gerador_de_video_e_som.py.*{re.escape(pptx.name)}.*--so-clipes"],
+                                            capture_output=True, text=True).stdout.split() if int(p) != os.getpid()]
+        if outros:
+            print(f"ERRO: já há {len(outros)} trabalhador(es) desta aula rodando (PIDs {' '.join(outros)}). "
+                  "Acompanhe ou encerre com: pkill -f gerador_de_video_e_som.py"); return
+    # plano de GPUs
+    VRAM_GB = 6.0
+    try: q = quadro_gpus()
+    except Exception: q = {}
+    slots = []
+    if a.gpu not in ("auto", "todas"):
+        for i in a.gpu.split(","): slots += [int(i)] * a.por_gpu
+    elif q:
+        print("GPUs: " + "  ".join(f"[{i}] {g[0]:.0f}GB livres/{g[1]}%" for i, g in sorted(q.items())))
+        for u, _, i in sorted((u, -l, i) for i, (l, u) in q.items() if u <= a.gpu_util_max and l >= VRAM_GB):
+            slots += [i] * min(a.por_gpu, int(q[i][0] / VRAM_GB))
+    if not slots: slots = [None]
+    por = {}
+    for s in slots: por.setdefault(s, []).append(s)
+    slots = []
+    while any(por.values()):
+        for g in list(por):
+            if por[g]: slots.append(por[g].pop())
+    n = min(a.paralelo, len(slots), len(roteiro)); slots = slots[:n]
+    # fatias balanceadas pelo tamanho do texto
+    fatias, carga = [[] for _ in range(n)], [0] * n
+    for r in sorted(roteiro, key=lambda r: -len(r["texto_fala"])):
+        k = carga.index(min(carga)); fatias[k].append(r["slide"]); carga[k] += len(r["texto_fala"])
     primeiro, ultimo = roteiro[0]["slide"], roteiro[-1]["slide"]
-
-    # 2) Fatias balanceadas pelo tamanho do texto (round-robin sobre slides ordenados por tamanho)
-    n = max(1, min(n, len(roteiro)))
-    por_tamanho = sorted(roteiro, key=lambda it: -len(it["texto_fala"]))
-    fatias = [[] for _ in range(n)]
-    carga = [0] * n
-    for it in por_tamanho:
-        k = carga.index(min(carga))
-        fatias[k].append(it["slide"]); carga[k] += len(it["texto_fala"])
-    fatias = [sorted(f) for f in fatias if f]
-
-    # 3) Lança os trabalhadores
-    base = [sys.executable, str(pathlib.Path(__file__).resolve()), str(pptx_path), "--roteiro", str(roteiro_path),
+    base = [sys.executable, str(pathlib.Path(__file__).resolve()), str(pptx), "--roteiro", str(roteiro_path),
             "--so-clipes", "--gpu", "todas", "--banner-primeiro", str(primeiro), "--banner-ultimo", str(ultimo),
-            "-v", args.voz, "--cfg", str(args.cfg), "--exag", str(args.exag), "--offset", str(args.offset),
-            "--duracao-aviso", str(args.duracao_aviso), "--aviso-inicio", args.aviso_inicio, "--aviso-fim", args.aviso_fim]
-    if args.amostra: base += ["-a", args.amostra]
-    for flag in ("forcar", "fp16", "permitir_cpu", "online", "sem_aviso_inicio", "sem_aviso_fim"):
-        if getattr(args, flag): base.append("--" + flag.replace("_", "-"))
-    if args.hf_home: base += ["--hf-home", args.hf_home]
-
-    logs_dir = work_dir / "logs"; logs_dir.mkdir(exist_ok=True)
-    procs = []
-    uso = {}
-    for g in slots: uso[g] = uso.get(g, 0) + 1
-    print(f"\nModo paralelo: {len(fatias)} trabalhadores, {len(roteiro)} slides; GPUs: "
-          + ", ".join(f"{g} x{c}" for g, c in sorted(uso.items(), key=lambda x: str(x[0]))))
-    t0 = time.time()
-    for k, fatia in enumerate(fatias):
-        log = logs_dir / f"trabalhador_{k+1:02d}.log"
-        cmd = base + ["-s", ",".join(map(str, fatia))]
+            "-v", a.voz, "--cfg", str(a.cfg), "--exag", str(a.exag), "--offset", str(a.offset),
+            "--duracao-aviso", str(a.duracao_aviso), "--aviso-inicio", a.aviso_inicio, "--aviso-fim", a.aviso_fim]
+    if a.amostra: base += ["-a", a.amostra]
+    if a.hf_home: base += ["--hf-home", a.hf_home]
+    for f in ("forcar", "permitir_cpu", "online"):
+        if getattr(a, f): base.append("--" + f.replace("_", "-"))
+    logs = work / "logs"; logs.mkdir(parents=True, exist_ok=True)
+    print(f"\nParalelo: {n} trabalhadores, {len(roteiro)} slides")
+    procs, t0 = [], time.time()
+    for k, (fatia, gpu) in enumerate(zip(fatias, slots), 1):
         env = os.environ.copy()
-        if slots[k] is not None:
-            env["CUDA_VISIBLE_DEVICES"] = str(slots[k])
-        print(f"  [{k+1:02d}] GPU {slots[k] if slots[k] is not None else '-'}  slides {fatia[0]}..{fatia[-1]} ({len(fatia)})  ->  {log.name}")
-        procs.append((k + 1, fatia, subprocess.Popen(cmd, stdout=open(log, "w", encoding="utf-8"),
-                                                     stderr=subprocess.STDOUT, env=env)))
-        time.sleep(3)   # escalona a carga dos modelos
-
-    # 4) Acompanha o progresso pelos clipes prontos
-    clips_dir = work_dir / "clipes"
-    esperados = {it["slide"] for it in roteiro}
-    ultimo_print = 0
-    while any(p.poll() is None for _, _, p in procs):
+        if gpu is not None: env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        log = logs / f"trabalhador_{k:02d}.log"
+        print(f"  [{k:02d}] GPU {gpu if gpu is not None else '-'}  {len(fatia)} slides  -> {log.name}")
+        procs.append((k, subprocess.Popen(base + ["-s", ",".join(map(str, sorted(fatia)))],
+                                          stdout=open(log, "w", encoding="utf-8"), stderr=subprocess.STDOUT, env=env)))
+        time.sleep(3)
+    clipes = [work / "clipes" / f"clip_{r['slide']:03d}.mp4" for r in roteiro]
+    visto = -1
+    while any(p.poll() is None for _, p in procs):
         time.sleep(10)
-        prontos = sum(1 for s in esperados if (clips_dir / f"clip_{s:03d}.mp4").exists())
-        if prontos != ultimo_print:
-            print(f"  progresso: {prontos}/{len(esperados)} clipes  ({time.time()-t0:.0f}s)"); ultimo_print = prontos
-    falhas = [(k, p.returncode) for k, _, p in procs if p.returncode != 0]
-    if falhas:
-        for k, rc in falhas:
-            print(f"ERRO: trabalhador {k:02d} terminou com código {rc}. Veja {logs_dir / f'trabalhador_{k:02d}.log'}")
-            print("  últimas linhas:"); print("   " + "\n   ".join(
-                (logs_dir / f"trabalhador_{k:02d}.log").read_text(encoding="utf-8", errors="replace").splitlines()[-8:]))
-        print("Corrija e rode de novo — os slides já concluídos ficam em cache.")
-        return
-
-    # 5) Concatena na ordem original dos slides
-    clipes = [clips_dir / f"clip_{it['slide']:03d}.mp4" for it in roteiro]
-    faltam = [c.name for c in clipes if not c.exists()]
-    if faltam:
-        print(f"ERRO: clipes não gerados: {faltam}"); return
-    print(f"\nSíntese concluída em {time.time()-t0:.0f}s. Concatenando...")
-    concatenar_clipes(pptx_path, work_dir, clipes, pathlib.Path(args.saida) if args.saida else None,
-                      slides_filtro, primeiro, ultimo)
+        prontos = sum(c.exists() for c in clipes)
+        if prontos != visto: print(f"  {prontos}/{len(clipes)} clipes ({time.time()-t0:.0f}s)"); visto = prontos
+    for k, p in procs:
+        if p.returncode != 0:
+            log = logs / f"trabalhador_{k:02d}.log"
+            print(f"ERRO no trabalhador {k:02d} (veja {log}):\n   " +
+                  "\n   ".join(log.read_text(encoding="utf-8", errors="replace").splitlines()[-6:])); return
+    if any(not c.exists() for c in clipes):
+        print("ERRO: faltam clipes:", [c.name for c in clipes if not c.exists()]); return
+    print(f"Síntese concluída em {time.time()-t0:.0f}s.")
+    concatenar(clipes, pathlib.Path(a.saida) if a.saida else saida_padrao(pptx, roteiro, bool(slides)))
 
 
-# -------------------------------------------------------------
-# CLI Entrypoint
-# -------------------------------------------------------------
+# ================================================================== CLI
+def parse_slides(s: str) -> list:
+    out = set()
+    for parte in (s or "").split(","):
+        parte = parte.strip()
+        if not parte: continue
+        if "-" in parte:
+            a, b = parte.split("-", 1); out.update(range(int(a or 1), int(b or 9999) + 1))
+        else: out.add(int(parte))
+    return sorted(out) or None
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Gerador de Vídeo e Som Automatizado para Apresentações")
-    parser.add_argument("pptx", nargs="?", help="Caminho do arquivo .pptx")
-    parser.add_argument("--roteiro", "-r", help="Arquivo JSON de roteiro (opcional)")
-    parser.add_argument("--voz", "-v", default="reinaldo_haas", choices=["reinaldo_haas", "reinaldo_f5", "antonio", "francisca"],
-                        help="Voz da narração: reinaldo_haas = Chatterbox; reinaldo_f5 = F5-TTS pt-BR (mais leve e rápido); "
-                             "antonio/francisca = edge-tts (nuvem). Padrao: reinaldo_haas")
-    parser.add_argument("--amostra", "-a", help="Áudio de referência da voz clonada (padrão: voz_referencia/amostra_nova.mp3)")
-    parser.add_argument("--cfg", type=float, default=CB_CFG_WEIGHT,
-                        help=f"Chatterbox cfg_weight: menor = mais fiel ao timbre da amostra (padrao: {CB_CFG_WEIGHT})")
-    parser.add_argument("--exag", type=float, default=CB_EXAGGERATION,
-                        help=f"Chatterbox exaggeration: expressividade, 0.5 e neutro (padrao: {CB_EXAGGERATION})")
-    parser.add_argument("--saida", "-o", help="Caminho do arquivo .mp4 de saída")
-    parser.add_argument("--slides", "-s", help="Filtro de slides (ex: '1', '1-5', '1,3,7', '10-')")
-    parser.add_argument("--aviso-inicio", default=DEFAULT_AVISO_INICIO,
-                        help="Texto do aviso de topo no primeiro slide (suporta \\N ou quebra de linha)")
-    parser.add_argument("--aviso-fim", default=DEFAULT_AVISO_FIM,
-                        help="Texto do aviso de topo no último slide (suporta \\N ou quebra de linha)")
-    parser.add_argument("--duracao-aviso", type=float, default=5.0,
-                        help="Duração em segundos do aviso de topo (padrao: 5.0s)")
-    parser.add_argument("--sem-aviso-inicio", action="store_true", help="Desativa o aviso de topo no primeiro slide")
-    parser.add_argument("--sem-aviso-fim", action="store_true", help="Desativa o aviso de topo no último slide")
-    parser.add_argument("--offset", type=float, default=-0.12,
-                        help="Offset de sincronia das legendas em segundos (padrao: -0.12s para eliminar atraso perceptual)")
-    parser.add_argument("--forcar", action="store_true", help="Força a regeração de todos os clipes e áudios do zero")
-    parser.add_argument("--fp16", action="store_true",
-                        help="Precisão mista na GPU: mais rápido e menos VRAM (recomendado em placas de 4-6 GB). "
-                             "Se der erro, o script volta para fp32 sozinho.")
-    parser.add_argument("--gpu", default="auto", metavar="N|auto|todas",
-                        help="Qual GPU usar num nó com várias: 'auto' escolhe a mais ociosa com memória livre (padrão); "
-                             "um índice fixa; 'todas' não altera CUDA_VISIBLE_DEVICES.")
-    parser.add_argument("--alinhar-cpu", action="store_true",
-                        help="Roda o alinhamento whisperx na CPU (menos VRAM por processo; automático no modo paralelo)")
-    parser.add_argument("--por-gpu", type=int, default=2, metavar="K",
-                        help="No modo paralelo, máximo de trabalhadores por placa (padrão 2; sem MPS, mais que isso rende pouco)")
-    parser.add_argument("--gpu-util-max", type=int, default=15, metavar="PCT",
-                        help="No modo paralelo, só usa placas com utilização <= PCT%% (padrão 15)")
-    parser.add_argument("--paralelo", "-p", type=int, default=1, metavar="N",
-                        help="Sintetiza com N processos em paralelo na mesma GPU (~3,5 GB de VRAM cada). "
-                             "Em GPU grande (>= 24 GB) use 4-8; speedup quase linear.")
-    parser.add_argument("--so-clipes", action="store_true", help=argparse.SUPPRESS)       # uso interno (trabalhador)
-    parser.add_argument("--banner-primeiro", type=int, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--banner-ultimo", type=int, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--permitir-cpu", action="store_true",
-                        help="Permite sintetizar a voz clonada na CPU (muito lento, ~10 min por slide)")
-    parser.add_argument("--online", action="store_true",
-                        help="Permite ao Hugging Face consultar/baixar modelos pela internet. Use só na PRIMEIRA execução "
-                             "(ou após limpar o cache); depois o padrão é 100%% offline, sem esperas de rede.")
-    parser.add_argument("--hf-home", help="Pasta local do cache de modelos (padrão: %%USERPROFILE%%\\.cache\\huggingface). "
-                                         "Evite pastas dentro do OneDrive.")
+    p = argparse.ArgumentParser(description="Vídeo-aula a partir de .pptx com voz clonada (local).",
+                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("pptx", nargs="?", help="arquivo .pptx (padrão: o primeiro da pasta atual)")
+    p.add_argument("-r", "--roteiro", help="roteiro JSON (opcional; senão vem das anotações do PPTX)")
+    p.add_argument("-s", "--slides", help="filtro: '5', '3-7', '1,4,9', '10-'")
+    p.add_argument("-v", "--voz", default="reinaldo_haas", choices=["reinaldo_haas", "reinaldo_f5", "antonio", "francisca"])
+    p.add_argument("-a", "--amostra", help=f"áudio de referência da voz (padrão: {AMOSTRA_PADRAO.relative_to(AQUI)})")
+    p.add_argument("--cfg", type=float, default=CB_CFG, help="Chatterbox: menor = mais fiel ao timbre")
+    p.add_argument("--exag", type=float, default=CB_EXAG, help="Chatterbox: expressividade (0.5 neutro)")
+    p.add_argument("-o", "--saida", help="arquivo .mp4 final")
+    p.add_argument("--offset", type=float, default=-0.12, help="deslocamento das legendas (s)")
+    p.add_argument("--aviso-inicio", default=DEFAULT_AVISO_INICIO); p.add_argument("--aviso-fim", default=DEFAULT_AVISO_FIM)
+    p.add_argument("--duracao-aviso", type=float, default=5.0)
+    p.add_argument("--sem-aviso-inicio", action="store_true"); p.add_argument("--sem-aviso-fim", action="store_true")
+    p.add_argument("--forcar", action="store_true", help="ignora o cache de áudio")
+    p.add_argument("--gpu", default="auto", help="'auto', índice (ex. 3) ou 'todas'")
+    p.add_argument("-p", "--paralelo", type=int, default=1, metavar="N", help="trabalhadores em paralelo (várias GPUs)")
+    p.add_argument("--por-gpu", type=int, default=2, help="máx. de trabalhadores por placa")
+    p.add_argument("--gpu-util-max", type=int, default=15, help="só usa placas com uso <= este %%")
+    p.add_argument("--permitir-cpu", action="store_true", help="aceita rodar sem GPU (muito lento)")
+    p.add_argument("--online", action="store_true", help="permite baixar modelos do Hugging Face (1ª vez)")
+    p.add_argument("--hf-home", help="pasta do cache de modelos (padrão ~/.cache/huggingface)")
+    for h in ("--so-clipes",): p.add_argument(h, action="store_true", help=argparse.SUPPRESS)
+    for h in ("--banner-primeiro", "--banner-ultimo"): p.add_argument(h, type=int, default=None, help=argparse.SUPPRESS)
+    a = p.parse_args()
 
-    args = parser.parse_args()
-
-    # ---- Modelos: cache local e modo offline (deve ocorrer ANTES de importar chatterbox/whisperx) ----
-    if args.hf_home:
-        os.environ["HF_HOME"] = str(pathlib.Path(args.hf_home).resolve())
+    # ambiente: modelos offline por padrão, GPU
+    if a.hf_home: os.environ["HF_HOME"] = str(pathlib.Path(a.hf_home).resolve())
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    if args.online:
-        os.environ.pop("HF_HUB_OFFLINE", None)
-        os.environ.pop("TRANSFORMERS_OFFLINE", None)
-        print("Modo ONLINE: modelos serão verificados/baixados do Hugging Face nesta execução.")
-    else:
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    if a.online: print("Modo ONLINE: modelos podem ser baixados do Hugging Face.")
+    else: os.environ["HF_HUB_OFFLINE"] = os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    if not a.so_clipes and a.paralelo <= 1: escolher_gpu(a.gpu)
+    if a.sem_aviso_inicio: a.aviso_inicio = None
+    if a.sem_aviso_fim: a.aviso_fim = None
 
-    if not args.so_clipes and args.paralelo <= 1:     # no modo paralelo o pai planeja as GPUs por trabalhador
-        escolher_gpu(args.gpu)
+    pptx = pathlib.Path(a.pptx) if a.pptx else next(iter(pathlib.Path(".").glob("*.pptx")), None)
+    if not pptx or not pptx.exists(): sys.exit(f"Arquivo .pptx não encontrado: {a.pptx}")
+    pptx = pptx.resolve()
+    work = pptx.parent / "video_work" / pptx.stem; work.mkdir(parents=True, exist_ok=True)
+    slides = parse_slides(a.slides)
+    roteiro = carregar_roteiro(pptx, work, a.roteiro, slides)
+    if not roteiro: sys.exit("Nenhum slide com texto para narrar.")
+    roteiro_path = pathlib.Path(a.roteiro).resolve() if a.roteiro else work / "roteiro_gerado_automaticamente.json"
 
-    pptx_path = None
-    if args.pptx:
-        pptx_path = pathlib.Path(args.pptx)
-    elif not sys.stdin.isatty():
-        linha = sys.stdin.readline().strip()
-        if linha:
-            pptx_path = pathlib.Path(linha)
+    if a.paralelo > 1 and not a.so_clipes:
+        return paralelo(a, pptx, roteiro, roteiro_path, slides)
 
-    if not pptx_path:
-        candidatos = list(pathlib.Path(".").glob("*.pptx"))
-        if candidatos:
-            pptx_path = candidatos[0]
-            print(f"Usando arquivo encontrado: {pptx_path.name}")
-        else:
-            print("Erro: Nenhum arquivo .pptx informado.")
-            sys.exit(1)
+    gpu = torch.cuda.is_available()
+    print(f"\n{len(roteiro)} slides ({roteiro[0]['slide']}..{roteiro[-1]['slide']}), voz '{a.voz}', "
+          f"{'GPU ' + torch.cuda.get_device_name(0) if gpu else 'CPU'}, {N_CPU} CPUs")
+    try:
+        voz = Sintetizador(a.voz, a.amostra, a.cfg, a.exag, a.permitir_cpu)
+    except Exception as e:
+        if os.environ.get("HF_HUB_OFFLINE") == "1" and any(k in str(e) for k in ("offline", "cache", "LocalEntryNotFound", "not found")):
+            sys.exit(f"Modelo ausente do cache local. Rode uma vez com --online.\n  ({str(e)[:200]})")
+        raise
+    banner_ini = a.banner_primeiro if a.banner_primeiro is not None else roteiro[0]["slide"]
+    banner_fim = a.banner_ultimo if a.banner_ultimo is not None else roteiro[-1]["slide"]
+    clipes = asyncio.run(processar(pptx, roteiro, voz, a, banner_ini, banner_fim))
+    if a.so_clipes:
+        print(f"[trabalhador] {len(clipes)} clipes prontos."); return
+    concatenar(clipes, pathlib.Path(a.saida) if a.saida else saida_padrao(pptx, roteiro, bool(slides)))
 
-    if not pptx_path.exists():
-        print(f"Erro: Arquivo '{pptx_path}' nao encontrado.")
-        sys.exit(1)
-
-    slides_filtro = None
-    if args.slides:
-        slides_set = set()
-        for parte in args.slides.split(","):
-            parte = parte.strip()
-            if not parte:
-                continue
-            if "-" in parte:
-                pedacos = parte.split("-")
-                if len(pedacos) == 2:
-                    ini = int(pedacos[0]) if pedacos[0] else 1
-                    fim = int(pedacos[1]) if pedacos[1] else 9999
-                    slides_set.update(range(ini, fim + 1))
-            else:
-                slides_set.add(int(parte))
-        slides_filtro = sorted(list(slides_set))
-
-    aviso_ini = None if args.sem_aviso_inicio else args.aviso_inicio
-    aviso_end = None if args.sem_aviso_fim else args.aviso_fim
-
-    if args.paralelo > 1 and not args.so_clipes:
-        executar_paralelo(args, pptx_path, slides_filtro, args.paralelo)
-        return
-
-    asyncio.run(executar(
-        pptx_path=pptx_path,
-        roteiro_path=pathlib.Path(args.roteiro) if args.roteiro else None,
-        nome_voz=args.voz,
-        amostra_ref=pathlib.Path(args.amostra) if args.amostra else None,
-        saida_video=pathlib.Path(args.saida) if args.saida else None,
-        slides_filtro=slides_filtro,
-        aviso_inicio=aviso_ini,
-        aviso_fim=aviso_end,
-        duracao_aviso=args.duracao_aviso,
-        cfg_weight=args.cfg,
-        exaggeration=args.exag,
-        permitir_cpu=args.permitir_cpu,
-        usar_fp16=args.fp16,
-        alinhar_cpu=args.alinhar_cpu,
-        offset_sincronia=args.offset,
-        forcar=args.forcar,
-        so_clipes=args.so_clipes,
-        banner_primeiro=args.banner_primeiro,
-        banner_ultimo=args.banner_ultimo
-    ))
 
 if __name__ == "__main__":
     main()
