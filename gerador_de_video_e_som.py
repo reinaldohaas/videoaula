@@ -1026,6 +1026,48 @@ def concatenar_clipes(pptx_path, work_dir, clipes_gerados, saida_video, slides_f
     print("=======================================================")
 
 # -------------------------------------------------------------
+# Escolha automática da GPU em nó compartilhado
+# -------------------------------------------------------------
+def escolher_gpu(pedido: str = "auto", min_livre_gb: float = 8.0, leituras: int = 2, intervalo: float = 3.0):
+    """Define CUDA_VISIBLE_DEVICES antes de qualquer uso de CUDA.
+    pedido: 'auto' (placa mais ociosa com memória livre), um índice ('3'), ou 'todas' (não mexe)."""
+    if pedido == "todas":
+        return
+    if pedido != "auto":
+        os.environ["CUDA_VISIBLE_DEVICES"] = pedido
+        print(f"GPU fixada: {pedido}")
+        return
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        print(f"GPU (do ambiente): {os.environ['CUDA_VISIBLE_DEVICES']}")
+        return
+    try:
+        def ler():
+            out = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.free,utilization.gpu",
+                                  "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=20).stdout
+            return {int(i): (float(f) / 1024, int(u)) for i, f, u in (l.split(",") for l in out.strip().splitlines())}
+        lidas = [ler()]
+        if len(lidas[0]) <= 1:
+            return                                   # uma GPU só: nada a escolher
+        for _ in range(leituras - 1):
+            time.sleep(intervalo); lidas.append(ler())
+        placas = []
+        for i in lidas[0]:
+            livre = min(l[i][0] for l in lidas); util = max(l[i][1] for l in lidas)
+            placas.append((util, -livre, i, livre))
+        placas.sort()
+        print("GPUs: " + "  ".join(f"[{i}] {livre:.0f}GB livres/{util}%" for util, _, i, livre in sorted(placas, key=lambda x: x[2])))
+        candidatas = [p for p in placas if p[3] >= min_livre_gb]
+        if not candidatas:
+            print(f"Aviso: nenhuma GPU com >= {min_livre_gb:.0f} GB livres; usando a mais ociosa mesmo assim.")
+            candidatas = placas
+        util, _, idx, livre = candidatas[0]
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(idx)
+        print(f"GPU escolhida: {idx} ({livre:.0f} GB livres, {util}% de uso)")
+    except Exception as e:
+        print(f"(não foi possível consultar nvidia-smi: {str(e)[:60]}; usando a GPU padrão)")
+
+
+# -------------------------------------------------------------
 # Modo paralelo: N trabalhadores na mesma GPU, cada um com uma fatia dos slides
 # -------------------------------------------------------------
 def executar_paralelo(args, pptx_path: pathlib.Path, slides_filtro: list, n: int):
@@ -1092,7 +1134,7 @@ def executar_paralelo(args, pptx_path: pathlib.Path, slides_filtro: list, n: int
 
     # 3) Lança os trabalhadores
     base = [sys.executable, str(pathlib.Path(__file__).resolve()), str(pptx_path), "--roteiro", str(roteiro_path),
-            "--so-clipes", "--banner-primeiro", str(primeiro), "--banner-ultimo", str(ultimo),
+            "--so-clipes", "--gpu", "todas", "--banner-primeiro", str(primeiro), "--banner-ultimo", str(ultimo),
             "-v", args.voz, "--cfg", str(args.cfg), "--exag", str(args.exag), "--offset", str(args.offset),
             "--duracao-aviso", str(args.duracao_aviso), "--aviso-inicio", args.aviso_inicio, "--aviso-fim", args.aviso_fim]
     if args.amostra: base += ["-a", args.amostra]
@@ -1172,6 +1214,9 @@ def main():
     parser.add_argument("--fp16", action="store_true",
                         help="Precisão mista na GPU: mais rápido e menos VRAM (recomendado em placas de 4-6 GB). "
                              "Se der erro, o script volta para fp32 sozinho.")
+    parser.add_argument("--gpu", default="auto", metavar="N|auto|todas",
+                        help="Qual GPU usar num nó com várias: 'auto' escolhe a mais ociosa com memória livre (padrão); "
+                             "um índice fixa; 'todas' não altera CUDA_VISIBLE_DEVICES.")
     parser.add_argument("--paralelo", "-p", type=int, default=1, metavar="N",
                         help="Sintetiza com N processos em paralelo na mesma GPU (~3,5 GB de VRAM cada). "
                              "Em GPU grande (>= 24 GB) use 4-8; speedup quase linear.")
@@ -1200,6 +1245,9 @@ def main():
     else:
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    if not args.so_clipes:            # trabalhadores herdam a escolha do pai
+        escolher_gpu(args.gpu)
 
     pptx_path = None
     if args.pptx:
