@@ -1,0 +1,8 @@
+# torch/torchaudio: instale antes, com a build CUDA adequada (ver README)
+chatterbox-tts
+whisperx
+f5-tts
+faster-whisper
+edge-tts
+python-pptx          # Linux: leitura das anotações do .pptx
+pywin32; sys_platform == "win32"   # Windows: exportação via PowerPoint

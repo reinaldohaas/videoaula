@@ -218,3 +218,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---- videoaula: amostras de voz e material gerado (nunca versionar) ----
+voz_referencia/*.mp3
+voz_referencia/*.wav
+voz_referencia/*.txt
+video_work/
+video/
+*.mp4
+*.wav
+*.pptx
+processed/
+checkpoints_openvoice/
+vozes/
