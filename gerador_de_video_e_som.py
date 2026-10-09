@@ -1035,6 +1035,29 @@ def executar_paralelo(args, pptx_path: pathlib.Path, slides_filtro: list, n: int
     work_dir.mkdir(parents=True, exist_ok=True)
     slides_img_dir = work_dir / "slides_img"
 
+    # 0) Trava: não iniciar se já há trabalhadores deste PPTX rodando (disputariam a GPU e estourariam a VRAM)
+    if sys.platform != "win32":
+        try:
+            ps = subprocess.run(["pgrep", "-f", f"gerador_de_video_e_som.py.*{re.escape(pptx_path.name)}.*--so-clipes"],
+                                capture_output=True, text=True).stdout.split()
+            ps = [q for q in ps if int(q) != os.getpid()]
+            if ps:
+                print(f"ERRO: já existem {len(ps)} trabalhador(es) desta apresentação em execução (PIDs {' '.join(ps)}).")
+                print("  Acompanhe no terminal original ou encerre com:  pkill -f gerador_de_video_e_som.py")
+                return
+        except Exception:
+            pass
+
+    # 0b) Dimensiona N pela VRAM livre (cada trabalhador usa ~6-7 GB com whisperx na GPU)
+    VRAM_POR_TRABALHADOR_GB = 7.0
+    if torch.cuda.is_available():
+        livre_gb, total_gb = (x / 1e9 for x in torch.cuda.mem_get_info(0))
+        cabem = max(1, int(livre_gb / VRAM_POR_TRABALHADOR_GB))
+        if n > cabem:
+            print(f"Aviso: {livre_gb:.0f} GB livres na GPU -> reduzindo --paralelo de {n} para {cabem} "
+                  f"(~{VRAM_POR_TRABALHADOR_GB:.0f} GB por trabalhador).")
+            n = cabem
+
     # 1) Roteiro e imagens, uma única vez, no processo pai (evita corrida no LibreOffice/PowerPoint)
     if args.roteiro and pathlib.Path(args.roteiro).exists():
         roteiro_path = pathlib.Path(args.roteiro).resolve()
