@@ -569,7 +569,7 @@ class MotorVoz:
                     print(f"  (prepare_conditionals indisponível: {str(e)[:60]} — referência será recodificada por frase)")
                     self.conds_prontos = False
             else:
-                self.ref_wav, self.ref_text = self._preparar_referencia_f5(self.ref_wav)
+                self.ref_wav, self.ref_text = self._preparar_referencia_f5(getattr(self, "ref_wav_origem", self.ref_wav))
                 self._carregar_f5()
 
             # Alinhamento roda na CPU de propósito: é barato e libera ~1,2 GB de VRAM para o Chatterbox.
@@ -917,6 +917,7 @@ async def executar(
         raise
 
     clipes_gerados = []
+    renders_pendentes = []
     for item in roteiro:
         s_num = item["slide"]
         texto_fala = item.get("texto_fala", "").strip()
@@ -1018,13 +1019,16 @@ async def executar(
         cmd[cmd.index(str(audio_wav))] = str(wav_loc)
         cmd[cmd.index("-vf") + 1] = f"subtitles='{str(ass_loc).replace(chr(92), '/').replace(':', chr(92) + ':')}'"
         cmd[-1] = str(tmp_mp4)
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_ambiente_ffmpeg())
-        _sh.move(str(tmp_mp4), str(clip_mp4))
-        for f in (img_loc, wav_loc, ass_loc):
-            try: f.unlink()
-            except Exception: pass
-        print(f"  Clipe renderizado em {time.time()-t_ff:.1f}s")
+        # ffmpeg em segundo plano: a codificação (CPU) se sobrepõe à síntese do próximo slide (GPU)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=_ambiente_ffmpeg())
+        renders_pendentes.append((proc, s_num, tmp_mp4, clip_mp4, (img_loc, wav_loc, ass_loc), t_ff))
         clipes_gerados.append(clip_mp4)
+        # Não deixa acumular mais que 2 codificações por trabalhador
+        while len([r for r in renders_pendentes if r[0].poll() is None]) > 2:
+            time.sleep(0.5)
+        _finalizar_renders(renders_pendentes, apenas_concluidos=True)
+
+    _finalizar_renders(renders_pendentes, apenas_concluidos=False)
 
     if not clipes_gerados:
         print("Erro: Nenhum clipe gerado.")
@@ -1035,6 +1039,24 @@ async def executar(
         return
 
     concatenar_clipes(pptx_path, work_dir, clipes_gerados, saida_video, slides_filtro, primeiro_slide_num, ultimo_slide_num)
+
+
+def _finalizar_renders(pendentes: list, apenas_concluidos: bool):
+    """Recolhe ffmpegs em segundo plano: move o mp4 de /tmp para o destino e limpa as cópias locais."""
+    import shutil as _sh
+    restantes = []
+    for proc, s_num, tmp_mp4, clip_mp4, locais, t_ff in pendentes:
+        if apenas_concluidos and proc.poll() is None:
+            restantes.append((proc, s_num, tmp_mp4, clip_mp4, locais, t_ff)); continue
+        _, err = proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg falhou no slide {s_num}: {err.decode(errors='replace')[-400:]}")
+        _sh.move(str(tmp_mp4), str(clip_mp4))
+        for f in locais:
+            try: f.unlink()
+            except Exception: pass
+        print(f"  Clipe {s_num:03d} renderizado em {time.time()-t_ff:.1f}s (em segundo plano)")
+    pendentes[:] = restantes
 
 
 def concatenar_clipes(pptx_path, work_dir, clipes_gerados, saida_video, slides_filtro, primeiro_slide_num, ultimo_slide_num):
