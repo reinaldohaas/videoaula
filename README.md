@@ -54,6 +54,7 @@ python gerador_de_video_e_som.py aula.pptx -s 3-5     # só alguns slides
 python gerador_de_video_e_som.py aula.pptx -v reinaldo_f5   # motor F5-TTS pt-BR
 python gerador_de_video_e_som.py aula.pptx --cfg 0.3  # mais fiel ao timbre (Chatterbox)
 python gerador_de_video_e_som.py aula.pptx --forcar   # ignora o cache
+python gerador_de_video_e_som.py aula.pptx --paralelo 8   # GPU grande: 8 processos em paralelo (~5x mais rápido)
 ```
 
 `python gerador_de_video_e_som.py -h` lista todas as opções.
